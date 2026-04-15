@@ -12,23 +12,31 @@ import {
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 
-const FIXED_WS_BASE = "wss://chat-mobile-backend-production.up.railway.app/ws";
+const API_BASE = "https://chat-mobile-backend-production.up.railway.app";
+const WS_BASE = "wss://chat-mobile-backend-production.up.railway.app/ws";
 
 export default function App() {
+  const [authMode, setAuthMode] = useState("login");
   const [username, setUsername] = useState("");
-  const [enteredName, setEnteredName] = useState("");
+  const [password, setPassword] = useState("");
+  const [token, setToken] = useState("");
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState("");
+
   const [connected, setConnected] = useState(false);
   const [inputText, setInputText] = useState("");
   const [messages, setMessages] = useState([]);
+  const [onlineUsers, setOnlineUsers] = useState([]);
   const socketRef = useRef(null);
 
   const wsUrl = useMemo(() => {
-    const encodedName = encodeURIComponent(enteredName || "匿名用户");
-    return `${FIXED_WS_BASE}?username=${encodedName}`;
-  }, [enteredName]);
+    const encodedToken = encodeURIComponent(token);
+    return `${WS_BASE}?token=${encodedToken}`;
+  }, [token]);
 
   useEffect(() => {
-    if (!connected) {
+    if (!connected || !token) {
       return undefined;
     }
 
@@ -50,6 +58,11 @@ export default function App() {
     socket.onmessage = (event) => {
       try {
         const payload = JSON.parse(event.data);
+        if (payload.type === "online") {
+          setOnlineUsers(payload.users || []);
+          return;
+        }
+
         setMessages((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, ...payload }]);
       } catch (error) {
         setMessages((prev) => [
@@ -71,12 +84,13 @@ export default function App() {
           id: `ws-error-${Date.now()}`,
           type: "system",
           sender: "系统",
-          content: "网络错误，请检查服务端或局域网连接",
+          content: "网络错误，请检查服务端状态",
         },
       ]);
     };
 
     socket.onclose = () => {
+      setConnected(false);
       setMessages((prev) => [
         ...prev,
         {
@@ -92,15 +106,51 @@ export default function App() {
       socket.close();
       socketRef.current = null;
     };
-  }, [connected, wsUrl]);
+  }, [connected, token, wsUrl]);
 
-  const joinChat = () => {
+  const submitAuth = async () => {
     const cleanName = username.trim();
-    if (!cleanName) {
+    if (!cleanName || !password.trim()) {
+      setAuthError("用户名和密码不能为空");
       return;
     }
-    setEnteredName(cleanName);
-    setConnected(true);
+
+    setAuthLoading(true);
+    setAuthError("");
+    try {
+      const response = await fetch(`${API_BASE}/auth/${authMode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: cleanName, password }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        setAuthError(result.detail || "认证失败");
+        return;
+      }
+
+      setToken(result.token);
+      setCurrentUser(result.user);
+      setConnected(true);
+    } catch (error) {
+      setAuthError("请求失败，请检查后端服务状态");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const logout = () => {
+    if (socketRef.current) {
+      socketRef.current.close();
+    }
+    setToken("");
+    setCurrentUser(null);
+    setConnected(false);
+    setUsername("");
+    setPassword("");
+    setMessages([]);
+    setOnlineUsers([]);
+    setAuthError("");
   };
 
   const sendMessage = () => {
@@ -112,32 +162,43 @@ export default function App() {
     setInputText("");
   };
 
-  const leaveChat = () => {
-    if (socketRef.current) {
-      socketRef.current.close();
-    }
-    setConnected(false);
-    setMessages([]);
-  };
-
-  if (!connected) {
+  if (!token) {
     return (
       <SafeAreaView style={styles.container}>
         <StatusBar style="dark" />
         <View style={styles.loginCard}>
-          <Text style={styles.title}>多人聊天</Text>
-          <Text style={styles.subtitle}>输入昵称后加入群聊</Text>
+          <Text style={styles.title}>起源聊天室</Text>
+          <Text style={styles.subtitle}>账号密码登录后进入多人聊天</Text>
           <TextInput
             style={styles.input}
             value={username}
             onChangeText={setUsername}
-            placeholder="你的昵称"
+            placeholder="用户名（至少3位）"
             autoCapitalize="none"
           />
-          <TouchableOpacity style={styles.button} onPress={joinChat}>
-            <Text style={styles.buttonText}>进入聊天室</Text>
+          <TextInput
+            style={styles.input}
+            value={password}
+            onChangeText={setPassword}
+            placeholder="密码（至少6位）"
+            secureTextEntry
+            autoCapitalize="none"
+          />
+          {authError ? <Text style={styles.errorText}>{authError}</Text> : null}
+          <TouchableOpacity style={styles.button} onPress={submitAuth}>
+            <Text style={styles.buttonText}>
+              {authLoading ? "处理中..." : authMode === "login" ? "登录" : "注册"}
+            </Text>
           </TouchableOpacity>
-          <Text style={styles.tip}>已固定连接到公网聊天服务器</Text>
+          <TouchableOpacity
+            style={styles.switchModeBtn}
+            onPress={() => setAuthMode((prev) => (prev === "login" ? "register" : "login"))}
+          >
+            <Text style={styles.switchModeText}>
+              {authMode === "login" ? "没有账号？去注册" : "已有账号？去登录"}
+            </Text>
+          </TouchableOpacity>
+          <Text style={styles.tip}>用户信息将保存到服务器（SQLite）</Text>
         </View>
       </SafeAreaView>
     );
@@ -151,11 +212,17 @@ export default function App() {
         behavior={Platform.OS === "ios" ? "padding" : undefined}
       >
         <View style={styles.header}>
-          <Text style={styles.headerTitle}>当前用户：{enteredName}</Text>
-          <TouchableOpacity onPress={leaveChat}>
-            <Text style={styles.leaveText}>退出</Text>
+          <Text style={styles.headerTitle}>
+            当前用户：{currentUser?.username} (ID:{currentUser?.user_id})
+          </Text>
+          <TouchableOpacity onPress={logout}>
+            <Text style={styles.leaveText}>退出登录</Text>
           </TouchableOpacity>
         </View>
+        <Text style={styles.onlineText}>
+          在线人数：{onlineUsers.length} | 在线用户ID：
+          {onlineUsers.length > 0 ? onlineUsers.map((u) => u.user_id).join(", ") : "无"}
+        </Text>
 
         <FlatList
           style={styles.list}
@@ -163,7 +230,10 @@ export default function App() {
           keyExtractor={(item) => item.id}
           renderItem={({ item }) => (
             <View style={item.type === "chat" ? styles.chatBubble : styles.systemBubble}>
-              <Text style={styles.sender}>{item.sender}</Text>
+              <Text style={styles.sender}>
+                {item.sender}
+                {item.sender_id ? ` (ID:${item.sender_id})` : ""}
+              </Text>
               <Text style={styles.messageText}>{item.content}</Text>
             </View>
           )}
@@ -211,6 +281,19 @@ const styles = StyleSheet.create({
     color: "#666",
     marginBottom: 12,
   },
+  errorText: {
+    marginBottom: 10,
+    color: "#d63737",
+    fontWeight: "600",
+  },
+  switchModeBtn: {
+    marginTop: 10,
+    alignItems: "center",
+  },
+  switchModeText: {
+    color: "#246bff",
+    fontWeight: "600",
+  },
   input: {
     borderColor: "#d0d7e2",
     borderWidth: 1,
@@ -248,6 +331,12 @@ const styles = StyleSheet.create({
   },
   headerTitle: {
     fontSize: 15,
+    fontWeight: "600",
+  },
+  onlineText: {
+    color: "#2d3b66",
+    marginBottom: 8,
+    fontSize: 13,
     fontWeight: "600",
   },
   leaveText: {
