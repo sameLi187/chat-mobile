@@ -1,0 +1,14 @@
+﻿# Python
+backend/.venv/
+backend/__pycache__/
+backend/*.pyc
+
+# Node / Expo
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
