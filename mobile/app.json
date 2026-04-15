@@ -1,9 +1,31 @@
 ﻿{
   "expo": {
-    "name": "多人聊天",
-    "slug": "chat-mobile-app",
+    "name": "起源",
+    "slug": "qiyuan-chat",
     "version": "1.0.0",
     "orientation": "portrait",
-    "platforms": ["ios", "android", "web"]
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
+    "android": {
+      "package": "com.sameli187.qiyuan"
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "kotlinVersion": "1.9.25"
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "a12639f5-eddc-4c58-8f21-14766a336389"
+      }
+    }
   }
 }

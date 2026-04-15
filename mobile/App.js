@@ -12,12 +12,11 @@ import {
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 
-const DEFAULT_WS_BASE = "wss://your-backend-domain/ws";
+const FIXED_WS_BASE = "wss://chat-mobile-backend-production.up.railway.app/ws";
 
 export default function App() {
   const [username, setUsername] = useState("");
   const [enteredName, setEnteredName] = useState("");
-  const [serverUrl, setServerUrl] = useState(DEFAULT_WS_BASE);
   const [connected, setConnected] = useState(false);
   const [inputText, setInputText] = useState("");
   const [messages, setMessages] = useState([]);
@@ -25,9 +24,8 @@ export default function App() {
 
   const wsUrl = useMemo(() => {
     const encodedName = encodeURIComponent(enteredName || "匿名用户");
-    const cleanBase = serverUrl.trim().replace(/\/+$/, "");
-    return `${cleanBase}?username=${encodedName}`;
-  }, [enteredName, serverUrl]);
+    return `${FIXED_WS_BASE}?username=${encodedName}`;
+  }, [enteredName]);
 
   useEffect(() => {
     if (!connected) {
@@ -98,8 +96,7 @@ export default function App() {
 
   const joinChat = () => {
     const cleanName = username.trim();
-    const cleanServerUrl = serverUrl.trim();
-    if (!cleanName || !/^wss?:\/\/.+\/ws$/i.test(cleanServerUrl)) {
+    if (!cleanName) {
       return;
     }
     setEnteredName(cleanName);
@@ -132,14 +129,6 @@ export default function App() {
           <Text style={styles.subtitle}>输入昵称后加入群聊</Text>
           <TextInput
             style={styles.input}
-            value={serverUrl}
-            onChangeText={setServerUrl}
-            placeholder="wss://你的域名/ws"
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          <TextInput
-            style={styles.input}
             value={username}
             onChangeText={setUsername}
             placeholder="你的昵称"
@@ -148,7 +137,7 @@ export default function App() {
           <TouchableOpacity style={styles.button} onPress={joinChat}>
             <Text style={styles.buttonText}>进入聊天室</Text>
           </TouchableOpacity>
-          <Text style={styles.tip}>支持跨网络聊天：填公网 WebSocket 地址（wss://.../ws）</Text>
+          <Text style={styles.tip}>已固定连接到公网聊天服务器</Text>
         </View>
       </SafeAreaView>
     );
