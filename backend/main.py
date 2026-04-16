@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import hmac
@@ -83,6 +83,11 @@ class GachaDrawRequest(BaseModel):
     count: int = Field(ge=1, le=10)
 
 
+class SellRequest(BaseModel):
+    inventory_id: int = Field(ge=1)
+    quantity: int = Field(ge=1, le=99)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -160,9 +165,17 @@ def init_db() -> None:
                 item_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 slot TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'equipment',
                 quality TEXT NOT NULL,
                 level_required INTEGER NOT NULL,
                 power INTEGER NOT NULL,
+                hp INTEGER NOT NULL DEFAULT 0,
+                attack INTEGER NOT NULL DEFAULT 0,
+                defense INTEGER NOT NULL DEFAULT 0,
+                dodge REAL NOT NULL DEFAULT 0,
+                crit REAL NOT NULL DEFAULT 0,
+                block REAL NOT NULL DEFAULT 0,
+                lifesteal REAL NOT NULL DEFAULT 0,
                 set_key TEXT,
                 set_level INTEGER,
                 bonus_trait TEXT
@@ -200,12 +213,62 @@ def init_db() -> None:
                 item_id TEXT NOT NULL,
                 equipped INTEGER NOT NULL DEFAULT 0,
                 quantity INTEGER NOT NULL DEFAULT 1,
+                affix_json TEXT NOT NULL DEFAULT '[]',
+                bonus_hp INTEGER NOT NULL DEFAULT 0,
+                bonus_attack INTEGER NOT NULL DEFAULT 0,
+                bonus_defense INTEGER NOT NULL DEFAULT 0,
+                bonus_dodge REAL NOT NULL DEFAULT 0,
+                bonus_crit REAL NOT NULL DEFAULT 0,
+                bonus_block REAL NOT NULL DEFAULT 0,
+                bonus_lifesteal REAL NOT NULL DEFAULT 0,
+                bonus_crit_damage REAL NOT NULL DEFAULT 0,
+                bonus_freeze REAL NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id),
                 FOREIGN KEY (item_id) REFERENCES game_items(item_id)
             )
             """
         )
+        # lightweight migration for existing DB
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(game_items)").fetchall()}
+        if "category" not in columns:
+            conn.execute("ALTER TABLE game_items ADD COLUMN category TEXT NOT NULL DEFAULT 'equipment'")
+        if "hp" not in columns:
+            conn.execute("ALTER TABLE game_items ADD COLUMN hp INTEGER NOT NULL DEFAULT 0")
+        if "attack" not in columns:
+            conn.execute("ALTER TABLE game_items ADD COLUMN attack INTEGER NOT NULL DEFAULT 0")
+        if "defense" not in columns:
+            conn.execute("ALTER TABLE game_items ADD COLUMN defense INTEGER NOT NULL DEFAULT 0")
+        if "dodge" not in columns:
+            conn.execute("ALTER TABLE game_items ADD COLUMN dodge REAL NOT NULL DEFAULT 0")
+        if "crit" not in columns:
+            conn.execute("ALTER TABLE game_items ADD COLUMN crit REAL NOT NULL DEFAULT 0")
+        if "block" not in columns:
+            conn.execute("ALTER TABLE game_items ADD COLUMN block REAL NOT NULL DEFAULT 0")
+        if "lifesteal" not in columns:
+            conn.execute("ALTER TABLE game_items ADD COLUMN lifesteal REAL NOT NULL DEFAULT 0")
+        conn.execute("UPDATE game_items SET category = 'equipment' WHERE category IS NULL OR category = ''")
+        inv_columns = {r["name"] for r in conn.execute("PRAGMA table_info(player_inventory)").fetchall()}
+        if "affix_json" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN affix_json TEXT NOT NULL DEFAULT '[]'")
+        if "bonus_hp" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN bonus_hp INTEGER NOT NULL DEFAULT 0")
+        if "bonus_attack" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN bonus_attack INTEGER NOT NULL DEFAULT 0")
+        if "bonus_defense" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN bonus_defense INTEGER NOT NULL DEFAULT 0")
+        if "bonus_dodge" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN bonus_dodge REAL NOT NULL DEFAULT 0")
+        if "bonus_crit" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN bonus_crit REAL NOT NULL DEFAULT 0")
+        if "bonus_block" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN bonus_block REAL NOT NULL DEFAULT 0")
+        if "bonus_lifesteal" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN bonus_lifesteal REAL NOT NULL DEFAULT 0")
+        if "bonus_crit_damage" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN bonus_crit_damage REAL NOT NULL DEFAULT 0")
+        if "bonus_freeze" not in inv_columns:
+            conn.execute("ALTER TABLE player_inventory ADD COLUMN bonus_freeze REAL NOT NULL DEFAULT 0")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS player_wallet (
@@ -382,6 +445,166 @@ def group_member_ids(conn: sqlite3.Connection, group_id: int) -> set[int]:
     return {int(r["user_id"]) for r in rows}
 
 
+def compute_item_stats(
+    slot: str,
+    quality: str,
+    level_required: int,
+    set_key: str | None = None,
+) -> dict[str, float]:
+    quality_scale = {
+        "普通": 1.00,
+        "优秀": 1.18,
+        "精良": 1.40,
+        "史诗": 1.75,
+        "传奇": 2.05,
+        "神话": 2.40,
+    }
+    lv_scale = 1 + (level_required - 1) * 0.055
+    q_scale = quality_scale.get(quality, 1.0)
+    base = {
+        "weapon": {"attack": 20, "hp": 0, "defense": 0, "dodge": 0.0, "crit": 0.02, "block": 0.0, "lifesteal": 0.0},
+        "helmet": {"attack": 0, "hp": 30, "defense": 12, "dodge": 0.01, "crit": 0.0, "block": 0.02, "lifesteal": 0.0},
+        "chest": {"attack": 0, "hp": 60, "defense": 24, "dodge": 0.0, "crit": 0.0, "block": 0.03, "lifesteal": 0.0},
+        "gloves": {"attack": 5, "hp": 12, "defense": 10, "dodge": 0.02, "crit": 0.03, "block": 0.0, "lifesteal": 0.0},
+        "pants": {"attack": 0, "hp": 45, "defense": 18, "dodge": 0.01, "crit": 0.0, "block": 0.02, "lifesteal": 0.0},
+        "boots": {"attack": 0, "hp": 20, "defense": 9, "dodge": 0.04, "crit": 0.0, "block": 0.0, "lifesteal": 0.0},
+        "bag": {"attack": 0, "hp": 0, "defense": 0, "dodge": 0.0, "crit": 0.0, "block": 0.0, "lifesteal": 0.0},
+    }[slot]
+    stats = {
+        "attack": int(round(base["attack"] * lv_scale * q_scale)),
+        "hp": int(round(base["hp"] * lv_scale * q_scale)),
+        "defense": int(round(base["defense"] * lv_scale * q_scale)),
+        "dodge": round(base["dodge"] * q_scale, 4),
+        "crit": round(base["crit"] * q_scale, 4),
+        "block": round(base["block"] * q_scale, 4),
+        "lifesteal": round(base["lifesteal"] * q_scale, 4),
+    }
+    if set_key:
+        if "arc" in set_key:
+            stats["crit"] = round(stats["crit"] + 0.01, 4)
+            stats["dodge"] = round(stats["dodge"] + 0.01, 4)
+        elif "hunt" in set_key:
+            stats["attack"] += max(6, int(level_required * 0.4))
+            stats["crit"] = round(stats["crit"] + 0.03, 4)
+        elif "pal" in set_key:
+            stats["hp"] += max(20, int(level_required * 1.8))
+            stats["block"] = round(stats["block"] + 0.04, 4)
+        elif "iron" in set_key:
+            stats["defense"] += max(6, int(level_required * 0.6))
+            stats["hp"] += max(10, int(level_required * 1.1))
+    if quality == "史诗":
+        stats["lifesteal"] = round(stats["lifesteal"] + 0.01, 4)
+    return stats
+
+
+def build_combat_snapshot(level: int, scale: float) -> dict[str, Any]:
+    return {
+        "hp": int((150 + level * 42) * scale),
+        "attack": int((18 + level * 5) * scale),
+        "defense": int((10 + level * 3.2) * max(1.0, scale * 0.92)),
+        "dodge": round(min(0.04 + scale * 0.015, 0.28), 4),
+        "crit": round(min(0.03 + scale * 0.02, 0.3), 4),
+        "block": round(min(0.02 + scale * 0.01, 0.2), 4),
+    }
+
+
+def calculate_combat_score(stats: dict[str, Any]) -> float:
+    return (
+        float(stats["hp"]) * 0.18
+        + float(stats["attack"]) * 2.7
+        + float(stats["defense"]) * 1.9
+        + float(stats["dodge"]) * 260
+        + float(stats["crit"]) * 230
+        + float(stats["block"]) * 220
+        + float(stats.get("lifesteal", 0)) * 320
+        + float(stats.get("crit_damage", 0)) * 170
+        + float(stats.get("freeze", 0)) * 160
+    )
+
+
+def roll_weapon_affixes(item: dict[str, Any]) -> dict[str, Any]:
+    if str(item.get("quality")) != "史诗" or str(item.get("slot")) != "weapon":
+        return {
+            "affixes": [],
+            "bonus_hp": 0,
+            "bonus_attack": 0,
+            "bonus_defense": 0,
+            "bonus_dodge": 0.0,
+            "bonus_crit": 0.0,
+            "bonus_block": 0.0,
+            "bonus_lifesteal": 0.0,
+            "bonus_crit_damage": 0.0,
+            "bonus_freeze": 0.0,
+        }
+
+    level_required = int(item.get("level_required") or 1)
+    pool = [
+        {
+            "key": "crit_damage",
+            "label": "暴伤",
+            "roll": lambda: round(0.12 + level_required * 0.003 + random.random() * 0.08, 4),
+            "apply": lambda v, out: out.__setitem__("bonus_crit_damage", out["bonus_crit_damage"] + v),
+            "fmt": lambda v: f"暴伤+{round(v * 100, 1)}%",
+        },
+        {
+            "key": "freeze",
+            "label": "冰冻",
+            "roll": lambda: round(0.05 + level_required * 0.0015 + random.random() * 0.05, 4),
+            "apply": lambda v, out: out.__setitem__("bonus_freeze", out["bonus_freeze"] + v),
+            "fmt": lambda v: f"冰冻几率+{round(v * 100, 1)}%",
+        },
+        {
+            "key": "block",
+            "label": "格挡",
+            "roll": lambda: round(0.04 + level_required * 0.0018 + random.random() * 0.05, 4),
+            "apply": lambda v, out: out.__setitem__("bonus_block", out["bonus_block"] + v),
+            "fmt": lambda v: f"格挡+{round(v * 100, 1)}%",
+        },
+        {
+            "key": "lifesteal",
+            "label": "吸血",
+            "roll": lambda: round(0.03 + level_required * 0.0015 + random.random() * 0.04, 4),
+            "apply": lambda v, out: out.__setitem__("bonus_lifesteal", out["bonus_lifesteal"] + v),
+            "fmt": lambda v: f"吸血+{round(v * 100, 1)}%",
+        },
+        {
+            "key": "attack",
+            "label": "锋锐",
+            "roll": lambda: int(8 + level_required * 0.9 + random.randint(0, 12)),
+            "apply": lambda v, out: out.__setitem__("bonus_attack", out["bonus_attack"] + int(v)),
+            "fmt": lambda v: f"攻击+{int(v)}",
+        },
+        {
+            "key": "crit",
+            "label": "致命",
+            "roll": lambda: round(0.03 + level_required * 0.0015 + random.random() * 0.04, 4),
+            "apply": lambda v, out: out.__setitem__("bonus_crit", out["bonus_crit"] + v),
+            "fmt": lambda v: f"暴击+{round(v * 100, 1)}%",
+        },
+    ]
+    pick_count = random.choices([1, 2, 3], weights=[25, 50, 25], k=1)[0]
+    chosen = random.sample(pool, k=pick_count)
+    result = {
+        "affixes": [],
+        "bonus_hp": 0,
+        "bonus_attack": 0,
+        "bonus_defense": 0,
+        "bonus_dodge": 0.0,
+        "bonus_crit": 0.0,
+        "bonus_block": 0.0,
+        "bonus_lifesteal": 0.0,
+        "bonus_crit_damage": 0.0,
+        "bonus_freeze": 0.0,
+    }
+    for affix in chosen:
+        value = affix["roll"]()
+        affix["apply"](value, result)
+        result["affixes"].append(
+            {"key": affix["key"], "label": affix["label"], "value": value, "text": affix["fmt"](value)}
+        )
+    return result
+
+
 def seed_game_content() -> None:
     conn = get_db()
     try:
@@ -403,14 +626,29 @@ def seed_game_content() -> None:
                 for slot, base in slots:
                     for quality, q_scale in quality_scale.items():
                         power = int(round(base * lv_scale * q_scale))
+                        stats = compute_item_stats(slot, quality, lv)
                         item_id = f"BASE-{slot.upper()}-{lv}-{quality}"
                         name = f"{quality}{slot_cn[slot]}·Lv{lv}"
                         conn.execute(
                             """
-                            INSERT INTO game_items (item_id, name, slot, quality, level_required, power, set_key, set_level, bonus_trait)
-                            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, '')
+                            INSERT INTO game_items (item_id, name, slot, category, quality, level_required, power, hp, attack, defense, dodge, crit, block, lifesteal, set_key, set_level, bonus_trait)
+                            VALUES (?, ?, ?, 'equipment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, '')
                             """,
-                            (item_id, name, slot, quality, lv, power),
+                            (
+                                item_id,
+                                name,
+                                slot,
+                                quality,
+                                lv,
+                                power,
+                                stats["hp"],
+                                stats["attack"],
+                                stats["defense"],
+                                stats["dodge"],
+                                stats["crit"],
+                                stats["block"],
+                                stats["lifesteal"],
+                            ),
                         )
 
             epic_sets = {
@@ -436,15 +674,71 @@ def seed_game_content() -> None:
                     )
                 for slot in epic_slots:
                     power = int(round((22 if slot == "weapon" else 14) * (1 + (set_level - 1) * 0.055) * 1.75))
+                    stats = compute_item_stats(slot, "史诗", set_level, set_key)
                     item_id = f"{set_key.upper()}-{slot.upper()}"
                     name = f"{set_name}{slot_cn[slot]}·Lv{set_level}"
                     conn.execute(
                         """
-                        INSERT INTO game_items (item_id, name, slot, quality, level_required, power, set_key, set_level, bonus_trait)
-                        VALUES (?, ?, ?, '史诗', ?, ?, ?, ?, ?)
+                        INSERT INTO game_items (item_id, name, slot, category, quality, level_required, power, hp, attack, defense, dodge, crit, block, lifesteal, set_key, set_level, bonus_trait)
+                        VALUES (?, ?, ?, 'equipment', '史诗', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (item_id, name, slot, set_level, power, set_key, set_level, trait),
+                        (
+                            item_id,
+                            name,
+                            slot,
+                            set_level,
+                            power,
+                            stats["hp"],
+                            stats["attack"],
+                            stats["defense"],
+                            stats["dodge"],
+                            stats["crit"],
+                            stats["block"],
+                            stats["lifesteal"],
+                            set_key,
+                            set_level,
+                            trait,
+                        ),
                     )
+
+        consumables = [
+            ("ITEM-POTION-SMALL", "小型生命药剂", "consumable", 1, 25),
+            ("ITEM-POTION-MEDIUM", "中型生命药剂", "consumable", 20, 60),
+            ("ITEM-ELIXIR-AOE", "范围增幅药剂", "consumable", 30, 90),
+            ("ITEM-BOSS-SCROLL", "首领挑战卷轴", "consumable", 40, 120),
+        ]
+        for item_id, name, category, level_required, power in consumables:
+            exists = conn.execute("SELECT 1 FROM game_items WHERE item_id = ?", (item_id,)).fetchone()
+            if not exists:
+                conn.execute(
+                    """
+                    INSERT INTO game_items (item_id, name, slot, category, quality, level_required, power, hp, attack, defense, dodge, crit, block, lifesteal, set_key, set_level, bonus_trait)
+                    VALUES (?, ?, 'bag', ?, '优秀', ?, ?, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, '消耗型道具')
+                    """,
+                    (item_id, name, category, level_required, power),
+                )
+        rows = conn.execute(
+            "SELECT item_id, slot, quality, level_required, set_key FROM game_items"
+        ).fetchall()
+        for r in rows:
+            stats = compute_item_stats(r["slot"], r["quality"], int(r["level_required"]), r["set_key"])
+            conn.execute(
+                """
+                UPDATE game_items
+                SET hp = ?, attack = ?, defense = ?, dodge = ?, crit = ?, block = ?, lifesteal = ?
+                WHERE item_id = ?
+                """,
+                (
+                    stats["hp"],
+                    stats["attack"],
+                    stats["defense"],
+                    stats["dodge"],
+                    stats["crit"],
+                    stats["block"],
+                    stats["lifesteal"],
+                    r["item_id"],
+                ),
+            )
 
         has_dungeon = conn.execute("SELECT 1 FROM dungeons_game LIMIT 1").fetchone()
         if not has_dungeon:
@@ -579,19 +873,86 @@ def add_wallet_values(
         conn.close()
 
 
-def grant_item(user_id: int, item_id: str, equipped: int = 0) -> None:
+def grant_item(user_id: int, item_id: str, equipped: int = 0, item_data: dict[str, Any] | None = None) -> dict[str, Any]:
     conn = get_db()
     try:
+        source_item = item_data or conn.execute(
+            "SELECT item_id, name, slot, category, quality, level_required, power FROM game_items WHERE item_id = ?",
+            (item_id,),
+        ).fetchone()
+        source_dict = dict(source_item) if source_item else {"item_id": item_id}
+        affix_roll = roll_weapon_affixes(source_dict)
         conn.execute(
             """
-            INSERT INTO player_inventory (user_id, item_id, equipped, quantity, created_at)
-            VALUES (?, ?, ?, 1, ?)
+            INSERT INTO player_inventory (
+                user_id, item_id, equipped, quantity, affix_json,
+                bonus_hp, bonus_attack, bonus_defense, bonus_dodge, bonus_crit, bonus_block,
+                bonus_lifesteal, bonus_crit_damage, bonus_freeze, created_at
+            )
+            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, item_id, equipped, now_iso()),
+            (
+                user_id,
+                item_id,
+                equipped,
+                json.dumps(affix_roll["affixes"], ensure_ascii=False),
+                affix_roll["bonus_hp"],
+                affix_roll["bonus_attack"],
+                affix_roll["bonus_defense"],
+                affix_roll["bonus_dodge"],
+                affix_roll["bonus_crit"],
+                affix_roll["bonus_block"],
+                affix_roll["bonus_lifesteal"],
+                affix_roll["bonus_crit_damage"],
+                affix_roll["bonus_freeze"],
+                now_iso(),
+            ),
         )
+        inventory_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
         conn.commit()
+        return {
+            **source_dict,
+            "inventory_id": inventory_id,
+            "affixes": affix_roll["affixes"],
+            "bonus_hp": affix_roll["bonus_hp"],
+            "bonus_attack": affix_roll["bonus_attack"],
+            "bonus_defense": affix_roll["bonus_defense"],
+            "bonus_dodge": affix_roll["bonus_dodge"],
+            "bonus_crit": affix_roll["bonus_crit"],
+            "bonus_block": affix_roll["bonus_block"],
+            "bonus_lifesteal": affix_roll["bonus_lifesteal"],
+            "bonus_crit_damage": affix_roll["bonus_crit_damage"],
+            "bonus_freeze": affix_roll["bonus_freeze"],
+        }
     finally:
         conn.close()
+
+
+def item_sell_price(item: dict[str, Any]) -> int:
+    quality_base = {
+        "普通": 12,
+        "优秀": 22,
+        "精良": 45,
+        "史诗": 120,
+        "传奇": 260,
+        "神话": 500,
+    }
+    base = quality_base.get(str(item.get("quality")), 10)
+    level_part = int(item.get("level_required") or 1) * 2
+    power_part = int(item.get("power") or 0) // 3
+    category_bonus = 15 if str(item.get("category")) == "consumable" else 0
+    affix_bonus = 0
+    affixes = item.get("affixes") or []
+    if isinstance(affixes, str):
+        try:
+            affixes = json.loads(affixes)
+        except json.JSONDecodeError:
+            affixes = []
+    affix_bonus += len(affixes) * 25
+    affix_bonus += int((float(item.get("bonus_attack") or 0) + float(item.get("bonus_defense") or 0)) * 0.6)
+    affix_bonus += int(float(item.get("bonus_crit_damage") or 0) * 120)
+    affix_bonus += int(float(item.get("bonus_freeze") or 0) * 90)
+    return max(5, base + level_part + power_part + category_bonus + affix_bonus)
 
 
 def choose_drop_item(target_level: int, source_type: str) -> dict[str, Any] | None:
@@ -611,7 +972,7 @@ def choose_drop_item(target_level: int, source_type: str) -> dict[str, Any] | No
         if chosen_quality == "史诗":
             rows = conn.execute(
                 """
-                SELECT item_id, name, quality, level_required, power, set_key, bonus_trait
+                SELECT item_id, name, slot, category, quality, level_required, power, set_key, bonus_trait
                 FROM game_items
                 WHERE quality = '史诗'
                   AND level_required <= ?
@@ -622,7 +983,7 @@ def choose_drop_item(target_level: int, source_type: str) -> dict[str, Any] | No
         else:
             rows = conn.execute(
                 """
-                SELECT item_id, name, quality, level_required, power, set_key, bonus_trait
+                SELECT item_id, name, slot, category, quality, level_required, power, set_key, bonus_trait
                 FROM game_items
                 WHERE quality = ?
                   AND level_required <= ?
@@ -633,6 +994,24 @@ def choose_drop_item(target_level: int, source_type: str) -> dict[str, Any] | No
             return None
         row = random.choice(rows)
         return dict(row)
+    finally:
+        conn.close()
+
+
+def choose_consumable_item(target_level: int) -> dict[str, Any] | None:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT item_id, name, slot, category, quality, level_required, power, set_key, bonus_trait
+            FROM game_items
+            WHERE category = 'consumable' AND level_required <= ?
+            """,
+            (target_level,),
+        ).fetchall()
+        if not rows:
+            return None
+        return dict(random.choice(rows))
     finally:
         conn.close()
 
@@ -951,15 +1330,50 @@ def get_player_profile(user_id: int) -> dict[str, Any]:
 
         equipped_rows = conn.execute(
             """
-            SELECT pi.id AS inventory_id, gi.item_id, gi.name, gi.slot, gi.quality, gi.level_required, gi.power, gi.set_key, gi.set_level, gi.bonus_trait
+            SELECT pi.id AS inventory_id, pi.affix_json, pi.bonus_hp, pi.bonus_attack, pi.bonus_defense, pi.bonus_dodge, pi.bonus_crit, pi.bonus_block, pi.bonus_lifesteal, pi.bonus_crit_damage, pi.bonus_freeze, gi.item_id, gi.name, gi.slot, gi.category, gi.quality, gi.level_required, gi.power, gi.hp, gi.attack, gi.defense, gi.dodge, gi.crit, gi.block, gi.lifesteal, gi.set_key, gi.set_level, gi.bonus_trait
             FROM player_inventory pi
             JOIN game_items gi ON gi.item_id = pi.item_id
             WHERE pi.user_id = ? AND pi.equipped = 1
             """,
             (user_id,),
         ).fetchall()
-        equipped = [dict(r) for r in equipped_rows]
+        equipped = []
+        for r in equipped_rows:
+            item = dict(r)
+            try:
+                item["affixes"] = json.loads(item.get("affix_json") or "[]")
+            except json.JSONDecodeError:
+                item["affixes"] = []
+            equipped.append(item)
         total_power = sum(int(r["power"]) for r in equipped_rows)
+        total_stats = {
+            "hp": 120 + int(row["level"]) * 18,
+            "attack": 12 + int(row["level"]) * 4,
+            "defense": 8 + int(row["level"]) * 3,
+            "dodge": 0.03,
+            "crit": 0.05,
+            "block": 0.02,
+            "lifesteal": 0.0,
+            "crit_damage": 0.5,
+            "freeze": 0.0,
+        }
+        for r in equipped_rows:
+            total_stats["hp"] += int(r["hp"] or 0)
+            total_stats["attack"] += int(r["attack"] or 0)
+            total_stats["defense"] += int(r["defense"] or 0)
+            total_stats["dodge"] += float(r["dodge"] or 0)
+            total_stats["crit"] += float(r["crit"] or 0)
+            total_stats["block"] += float(r["block"] or 0)
+            total_stats["lifesteal"] += float(r["lifesteal"] or 0)
+            total_stats["hp"] += int(r["bonus_hp"] or 0)
+            total_stats["attack"] += int(r["bonus_attack"] or 0)
+            total_stats["defense"] += int(r["bonus_defense"] or 0)
+            total_stats["dodge"] += float(r["bonus_dodge"] or 0)
+            total_stats["crit"] += float(r["bonus_crit"] or 0)
+            total_stats["block"] += float(r["bonus_block"] or 0)
+            total_stats["lifesteal"] += float(r["bonus_lifesteal"] or 0)
+            total_stats["crit_damage"] += float(r["bonus_crit_damage"] or 0)
+            total_stats["freeze"] += float(r["bonus_freeze"] or 0)
 
         set_counts: dict[str, int] = {}
         for r in equipped_rows:
@@ -983,6 +1397,32 @@ def get_player_profile(user_id: int) -> dict[str, Any]:
                                 "bonus_desc": bonus["bonus_desc"],
                             }
                         )
+        for bonus in active_bonuses:
+            set_key = str(bonus["set_key"])
+            tier = int(bonus["tier"])
+            if "arc" in set_key:
+                total_stats["attack"] += 8 * tier
+                total_stats["crit"] += 0.01 * (tier / 2)
+            elif "hunt" in set_key:
+                total_stats["attack"] += 10 * tier
+                total_stats["crit"] += 0.015 * (tier / 2)
+                total_stats["dodge"] += 0.008 * (tier / 2)
+            elif "pal" in set_key:
+                total_stats["hp"] += 40 * tier
+                total_stats["defense"] += 6 * tier
+                total_stats["block"] += 0.015 * (tier / 2)
+                total_stats["lifesteal"] += 0.005 * (tier / 2)
+            elif "iron" in set_key:
+                total_stats["hp"] += 24 * tier
+                total_stats["attack"] += 7 * tier
+                total_stats["defense"] += 7 * tier
+
+        total_stats["dodge"] = round(min(total_stats["dodge"], 0.65), 4)
+        total_stats["crit"] = round(min(total_stats["crit"], 0.75), 4)
+        total_stats["block"] = round(min(total_stats["block"], 0.70), 4)
+        total_stats["lifesteal"] = round(min(total_stats["lifesteal"], 0.25), 4)
+        total_stats["crit_damage"] = round(min(total_stats["crit_damage"], 1.5), 4)
+        total_stats["freeze"] = round(min(total_stats["freeze"], 0.45), 4)
 
         wallet_row = conn.execute(
             """
@@ -1006,6 +1446,7 @@ def get_player_profile(user_id: int) -> dict[str, Any]:
             "exp": int(row["exp"]),
             "total_power": total_power,
             "equipped": equipped,
+            "total_stats": total_stats,
             "set_counts": set_counts,
             "active_bonuses": active_bonuses,
             "wallet": wallet,
@@ -1018,18 +1459,23 @@ def get_player_profile(user_id: int) -> dict[str, Any]:
 def game_bootstrap(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     get_user_id_from_header(authorization)
     maps = [
-        {"map_id": "M01", "name": "迷雾森林", "level_range": "1-12"},
+        {"map_id": "M01", "name": "雾隐林地", "level_range": "1-12"},
         {"map_id": "M02", "name": "断碑荒原", "level_range": "13-22"},
         {"map_id": "M03", "name": "黑岩峡谷", "level_range": "23-32"},
-        {"map_id": "M04", "name": "霜骨墓地", "level_range": "33-42"},
-        {"map_id": "M05", "name": "深渊边境", "level_range": "43-50"},
+        {"map_id": "M04", "name": "霜骸墓园", "level_range": "33-42"},
+        {"map_id": "M05", "name": "深渊边庭", "level_range": "43-50"},
     ]
     monsters = [
-        {"type": "普通怪", "hp_scale": 1.0, "atk_scale": 1.0},
-        {"type": "精英怪", "hp_scale": 2.4, "atk_scale": 1.5},
-        {"type": "地图Boss", "hp_scale": 5.0, "atk_scale": 2.2},
-        {"type": "副本Boss", "hp_scale": 10.0, "atk_scale": 2.2},
+        {"type": "普通怪", "label": "游荡魔群", "hp_scale": 1.0, "atk_scale": 1.0},
+        {"type": "精英怪", "label": "异化首目", "hp_scale": 2.4, "atk_scale": 1.5},
+        {"type": "地图Boss", "label": "区域领主", "hp_scale": 5.0, "atk_scale": 2.2},
+        {"type": "副本Boss", "label": "副本首领", "hp_scale": 10.0, "atk_scale": 2.2},
     ]
+    dungeon_encounters = {
+        "DUN30": {"trash": "灰烬铸奴", "elite": "熔链监工", "boss": "熔炉之心·格罗姆"},
+        "DUN40": {"trash": "霜庭遗臣", "elite": "寒冠行刑者", "boss": "霜王遗骸·维尔萨"},
+        "DUN50": {"trash": "裂隙吞徒", "elite": "深渊司判", "boss": "裂界魔君·阿扎克"},
+    }
     conn = get_db()
     try:
         dungeons = [
@@ -1048,6 +1494,7 @@ def game_bootstrap(authorization: str | None = Header(default=None)) -> dict[str
         "maps": maps,
         "monsters": monsters,
         "dungeons": dungeons,
+        "dungeon_encounters": dungeon_encounters,
     }
 
 
@@ -1064,7 +1511,7 @@ def game_inventory(authorization: str | None = Header(default=None)) -> dict[str
     try:
         rows = conn.execute(
             """
-            SELECT pi.id AS inventory_id, pi.equipped, pi.quantity, gi.item_id, gi.name, gi.slot, gi.quality, gi.level_required, gi.power, gi.set_key, gi.set_level, gi.bonus_trait
+            SELECT pi.id AS inventory_id, pi.equipped, pi.quantity, pi.affix_json, pi.bonus_hp, pi.bonus_attack, pi.bonus_defense, pi.bonus_dodge, pi.bonus_crit, pi.bonus_block, pi.bonus_lifesteal, pi.bonus_crit_damage, pi.bonus_freeze, gi.item_id, gi.name, gi.slot, gi.category, gi.quality, gi.level_required, gi.power, gi.hp, gi.attack, gi.defense, gi.dodge, gi.crit, gi.block, gi.lifesteal, gi.set_key, gi.set_level, gi.bonus_trait
             FROM player_inventory pi
             JOIN game_items gi ON gi.item_id = pi.item_id
             WHERE pi.user_id = ?
@@ -1072,7 +1519,14 @@ def game_inventory(authorization: str | None = Header(default=None)) -> dict[str
             """,
             (user_id,),
         ).fetchall()
-        inventory = [dict(r) for r in rows]
+        inventory = []
+        for r in rows:
+            item = dict(r)
+            try:
+                item["affixes"] = json.loads(item.get("affix_json") or "[]")
+            except json.JSONDecodeError:
+                item["affixes"] = []
+            inventory.append(item)
     finally:
         conn.close()
     return {"inventory": inventory}
@@ -1121,6 +1575,64 @@ def game_equip(
     return {"ok": True, "profile": get_player_profile(user_id)}
 
 
+@app.post("/game/sell")
+def game_sell(
+    body: SellRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    conn = get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT pi.id AS inventory_id, pi.quantity, pi.equipped, pi.affix_json, pi.bonus_attack, pi.bonus_defense, pi.bonus_crit_damage, pi.bonus_freeze, gi.item_id, gi.name, gi.category, gi.quality, gi.level_required, gi.power
+            FROM player_inventory pi
+            JOIN game_items gi ON gi.item_id = pi.item_id
+            WHERE pi.id = ? AND pi.user_id = ?
+            """,
+            (body.inventory_id, user_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="背包物品不存在")
+        if int(row["equipped"]) == 1:
+            raise HTTPException(status_code=400, detail="已穿戴物品不能出售")
+        if body.quantity > int(row["quantity"]):
+            raise HTTPException(status_code=400, detail="出售数量超过持有数量")
+
+        item = dict(row)
+        try:
+            item["affixes"] = json.loads(item.get("affix_json") or "[]")
+        except json.JSONDecodeError:
+            item["affixes"] = []
+        price_each = item_sell_price(item)
+        total_price = price_each * body.quantity
+        remain = int(row["quantity"]) - body.quantity
+        if remain <= 0:
+            conn.execute("DELETE FROM player_inventory WHERE id = ? AND user_id = ?", (body.inventory_id, user_id))
+        else:
+            conn.execute(
+                "UPDATE player_inventory SET quantity = ? WHERE id = ? AND user_id = ?",
+                (remain, body.inventory_id, user_id),
+            )
+        conn.execute("UPDATE player_wallet SET gold = gold + ? WHERE user_id = ?", (total_price, user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "sold": {
+            "inventory_id": body.inventory_id,
+            "item_id": item["item_id"],
+            "name": item["name"],
+            "quantity": body.quantity,
+            "price_each": price_each,
+            "total_price": total_price,
+        },
+        "profile": get_player_profile(user_id),
+    }
+
+
 @app.post("/game/dungeon/challenge")
 def game_dungeon_challenge(
     body: DungeonChallengeRequest,
@@ -1153,6 +1665,11 @@ def game_dungeon_challenge(
 
     min_set_level = int(dungeon["min_set_level"])
     min_set_pieces = int(dungeon["min_set_pieces"])
+    stat_requirements = {
+        "DUN30": {"hp": 900, "attack": 180, "defense": 120},
+        "DUN40": {"hp": 1800, "attack": 340, "defense": 240},
+        "DUN50": {"hp": 3000, "attack": 520, "defense": 360},
+    }
     count_eligible = 0
     for eq in profile["equipped"]:
         if eq.get("quality") == "史诗" and (eq.get("set_level") or 0) >= min_set_level:
@@ -1167,11 +1684,28 @@ def game_dungeon_challenge(
             "eligible_epic_pieces": count_eligible,
         }
 
+    required_stats = stat_requirements.get(body.dungeon_id, {})
+    current_stats = profile["total_stats"]
+    missing_stats: list[str] = []
+    for stat_key, required_value in required_stats.items():
+        if float(current_stats.get(stat_key, 0)) < float(required_value):
+            cn_name = {"hp": "生命", "attack": "攻击", "defense": "防御"}.get(stat_key, stat_key)
+            missing_stats.append(f"{cn_name}<{required_value}")
+    if missing_stats:
+        return {
+            "ok": False,
+            "reason": f"属性门槛不足：需要 {' / '.join(missing_stats)}",
+            "dungeon": dict(dungeon),
+            "profile": profile,
+            "required_stats": required_stats,
+        }
+
     return {
         "ok": True,
         "result": "challenge_passed",
         "dungeon": dict(dungeon),
         "profile": profile,
+        "required_stats": required_stats,
         "note": "满足挑战门槛，可进入副本战斗流程",
     }
 
@@ -1204,13 +1738,15 @@ def game_fight_monster(
         raise HTTPException(status_code=400, detail="怪物类型错误")
 
     target_level = min(map_level_cap[body.map_id], 50)
-    player_score = profile["total_power"] + len(profile["active_bonuses"]) * 25 + profile["level"] * 6
-    required_score = int((target_level * 7 + 60) * cfg["power_scale"])
+    player_stats = profile["total_stats"]
+    monster_stats = build_combat_snapshot(target_level, cfg["power_scale"])
+    player_score = calculate_combat_score(player_stats) + len(profile["active_bonuses"]) * 18
+    required_score = calculate_combat_score(monster_stats)
     if player_score <= 0:
         win_rate = 0.05
     else:
         ratio = player_score / max(1, required_score)
-        win_rate = max(0.10, min(0.95, 0.2 + ratio * 0.55))
+        win_rate = max(0.03, min(0.95, 0.08 + ratio * 0.52))
     won = random.random() < win_rate
 
     if won:
@@ -1225,7 +1761,7 @@ def game_fight_monster(
 
         dropped_item = choose_drop_item(target_level, cfg["drop_source"])
         if dropped_item:
-            grant_item(user_id, dropped_item["item_id"], equipped=0)
+            dropped_item = grant_item(user_id, dropped_item["item_id"], equipped=0, item_data=dropped_item)
         add_wallet_values(
             user_id,
             enhance_stone=random.randint(1, 3) if body.monster_type != "普通怪" else random.randint(0, 1),
@@ -1246,6 +1782,9 @@ def game_fight_monster(
         "won": won,
         "map_id": body.map_id,
         "monster_type": body.monster_type,
+        "player_score": round(player_score, 1),
+        "monster_score": round(required_score, 1),
+        "monster_stats": monster_stats,
         "win_rate_estimate": round(win_rate, 3),
         "rewards": {
             "exp": exp_gain,
@@ -1271,13 +1810,34 @@ def game_dungeon_settle(
     dungeon = gate["dungeon"]
     target_level = int(dungeon["recommended_level"])
     is_boss_source = "boss_dungeon"
+    profile = get_player_profile(user_id)
+    dungeon_scale = {30: 4.8, 40: 7.2, 50: 9.2}.get(target_level, 5.0)
+    boss_stats = build_combat_snapshot(target_level, dungeon_scale)
+    player_score = calculate_combat_score(profile["total_stats"]) + len(profile["active_bonuses"]) * 24
+    boss_score = calculate_combat_score(boss_stats)
+    clear_rate = max(0.02, min(0.9, 0.05 + (player_score / max(1, boss_score)) * 0.5))
     if not body.cleared:
         add_player_exp(user_id, int(target_level * 2.2))
         add_wallet_values(user_id, gold=int(target_level * 10))
         return {
             "ok": True,
             "cleared": False,
+            "clear_rate_estimate": round(clear_rate, 3),
+            "boss_stats": boss_stats,
             "rewards": {"exp": int(target_level * 2.2), "gold": int(target_level * 10)},
+            "profile": get_player_profile(user_id),
+        }
+
+    if random.random() > clear_rate:
+        add_player_exp(user_id, int(target_level * 2.8))
+        add_wallet_values(user_id, gold=int(target_level * 12))
+        return {
+            "ok": True,
+            "cleared": False,
+            "reason": "属性不足，副本首领将你击退",
+            "clear_rate_estimate": round(clear_rate, 3),
+            "boss_stats": boss_stats,
+            "rewards": {"exp": int(target_level * 2.8), "gold": int(target_level * 12)},
             "profile": get_player_profile(user_id),
         }
 
@@ -1297,7 +1857,7 @@ def game_dungeon_settle(
     for _ in range(item_count):
         item = choose_drop_item(target_level, is_boss_source)
         if item:
-            grant_item(user_id, item["item_id"], equipped=0)
+            item = grant_item(user_id, item["item_id"], equipped=0, item_data=item)
             drops.append(item)
             if item["quality"] == "史诗":
                 add_wallet_values(user_id, epic_shard=2)
@@ -1306,6 +1866,8 @@ def game_dungeon_settle(
         "ok": True,
         "cleared": True,
         "dungeon_id": body.dungeon_id,
+        "clear_rate_estimate": round(clear_rate, 3),
+        "boss_stats": boss_stats,
         "rewards": {"exp": exp_gain, "gold": gold_gain, "items": drops},
         "profile": get_player_profile(user_id),
     }
@@ -1349,10 +1911,15 @@ def game_gacha_draw(
                 stone = random.randint(1, 2)
                 add_wallet_values(user_id, reroll_stone=stone)
                 rewards.append({"type": "reroll_stone", "amount": stone})
+            elif roll < 0.97:
+                item = choose_consumable_item(min(50, profile["level"] + 5))
+                if item:
+                    item = grant_item(user_id, item["item_id"], equipped=0, item_data=item)
+                    rewards.append({"type": "item", "item": item})
             else:
                 item = choose_drop_item(min(50, profile["level"] + 5), "monster_elite")
                 if item:
-                    grant_item(user_id, item["item_id"], equipped=0)
+                    item = grant_item(user_id, item["item_id"], equipped=0, item_data=item)
                     rewards.append({"type": "item", "item": item})
         else:
             if roll < 0.30:
@@ -1367,10 +1934,15 @@ def game_gacha_draw(
                 stone = random.randint(2, 4)
                 add_wallet_values(user_id, reroll_stone=stone)
                 rewards.append({"type": "reroll_stone", "amount": stone})
+            elif roll < 0.82:
+                item = choose_consumable_item(max(30, min(50, profile["level"] + 8)))
+                if item:
+                    item = grant_item(user_id, item["item_id"], equipped=0, item_data=item)
+                    rewards.append({"type": "item", "item": item})
             else:
                 item = choose_drop_item(max(30, min(50, profile["level"] + 8)), "boss_dungeon")
                 if item:
-                    grant_item(user_id, item["item_id"], equipped=0)
+                    item = grant_item(user_id, item["item_id"], equipped=0, item_data=item)
                     rewards.append({"type": "item", "item": item})
 
     return {"ok": True, "pool": pool, "count": body.count, "rewards": rewards, "profile": get_player_profile(user_id)}
