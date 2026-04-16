@@ -527,7 +527,7 @@ App 当前已支持两个模式：
 
 ### 15.11 虚空洪流
 
-`a dark fantasy void torrent set icon collection, cosmic collapse theme, dark indigo armor, void cracks, luminous swirling energy, devastating aoe spellblade feeling`
+`a dark fantasy void surge set icon collection, cosmic collapse theme, dark indigo armor, void cracks, luminous swirling energy, devastating aoe spellblade feeling`
 
 ### 15.12 光耀圣域
 
