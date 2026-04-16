@@ -351,7 +351,6 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 init_db()
-seed_game_content()
 
 
 def user_by_username(conn: sqlite3.Connection, username: str) -> sqlite3.Row | None:
@@ -466,6 +465,9 @@ def seed_game_content() -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+seed_game_content()
 
 
 def init_player_game_state(user_id: int) -> None:
