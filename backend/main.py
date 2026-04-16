@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import secrets
 import sqlite3
 import uuid
@@ -57,6 +58,29 @@ class GroupCreateBody(BaseModel):
 
 class GroupInviteBody(BaseModel):
     username: str = Field(min_length=1, max_length=24)
+
+
+class EquipRequest(BaseModel):
+    inventory_id: int = Field(ge=1)
+
+
+class DungeonChallengeRequest(BaseModel):
+    dungeon_id: str = Field(min_length=1, max_length=24)
+
+
+class MonsterFightRequest(BaseModel):
+    map_id: str = Field(min_length=1, max_length=24)
+    monster_type: str = Field(min_length=1, max_length=24)
+
+
+class DungeonSettleRequest(BaseModel):
+    dungeon_id: str = Field(min_length=1, max_length=24)
+    cleared: bool = True
+
+
+class GachaDrawRequest(BaseModel):
+    pool: str = Field(min_length=1, max_length=24)  # normal / advanced
+    count: int = Field(ge=1, le=10)
 
 
 def now_iso() -> str:
@@ -115,6 +139,83 @@ def init_db() -> None:
                 joined_at TEXT NOT NULL,
                 PRIMARY KEY (group_id, user_id),
                 FOREIGN KEY (group_id) REFERENCES groups(id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_progress (
+                user_id INTEGER PRIMARY KEY,
+                level INTEGER NOT NULL DEFAULT 1,
+                exp INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_items (
+                item_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                quality TEXT NOT NULL,
+                level_required INTEGER NOT NULL,
+                power INTEGER NOT NULL,
+                set_key TEXT,
+                set_level INTEGER,
+                bonus_trait TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS set_bonuses (
+                set_key TEXT NOT NULL,
+                tier INTEGER NOT NULL,
+                bonus_desc TEXT NOT NULL,
+                PRIMARY KEY (set_key, tier)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dungeons_game (
+                dungeon_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                recommended_level INTEGER NOT NULL,
+                difficulty_tier INTEGER NOT NULL,
+                min_set_level INTEGER NOT NULL,
+                min_set_pieces INTEGER NOT NULL,
+                description TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                equipped INTEGER NOT NULL DEFAULT 0,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (item_id) REFERENCES game_items(item_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_wallet (
+                user_id INTEGER PRIMARY KEY,
+                gold INTEGER NOT NULL DEFAULT 0,
+                normal_ticket INTEGER NOT NULL DEFAULT 0,
+                advanced_ticket INTEGER NOT NULL DEFAULT 0,
+                enhance_stone INTEGER NOT NULL DEFAULT 0,
+                reroll_stone INTEGER NOT NULL DEFAULT 0,
+                epic_shard INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (user_id) REFERENCES users(id)
             )
             """
@@ -250,6 +351,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 init_db()
+seed_game_content()
 
 
 def user_by_username(conn: sqlite3.Connection, username: str) -> sqlite3.Row | None:
@@ -281,6 +383,258 @@ def group_member_ids(conn: sqlite3.Connection, group_id: int) -> set[int]:
     return {int(r["user_id"]) for r in rows}
 
 
+def seed_game_content() -> None:
+    conn = get_db()
+    try:
+        has_items = conn.execute("SELECT 1 FROM game_items LIMIT 1").fetchone()
+        if not has_items:
+            slots = [("weapon", 20), ("helmet", 12), ("chest", 24), ("gloves", 10), ("pants", 18), ("boots", 9)]
+            slot_cn = {
+                "weapon": "武器",
+                "helmet": "头盔",
+                "chest": "胸甲",
+                "gloves": "手套",
+                "pants": "裤子",
+                "boots": "鞋子",
+            }
+            quality_scale = {"普通": 1.00, "优秀": 1.18, "精良": 1.40}
+            levels = [1, 10, 20, 30, 40, 50]
+            for lv in levels:
+                lv_scale = 1 + (lv - 1) * 0.055
+                for slot, base in slots:
+                    for quality, q_scale in quality_scale.items():
+                        power = int(round(base * lv_scale * q_scale))
+                        item_id = f"BASE-{slot.upper()}-{lv}-{quality}"
+                        name = f"{quality}{slot_cn[slot]}·Lv{lv}"
+                        conn.execute(
+                            """
+                            INSERT INTO game_items (item_id, name, slot, quality, level_required, power, set_key, set_level, bonus_trait)
+                            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, '')
+                            """,
+                            (item_id, name, slot, quality, lv, power),
+                        )
+
+            epic_sets = {
+                "set30_iron": ("铁壁战痕", 30, ("近战伤害+8%，减伤+6%", "连击3层触发震荡波", "终结技后4秒攻防+12%"), "均衡"),
+                "set30_hunt": ("猎风断星", 30, ("暴击率+8%", "第3次命中追加穿刺", "每8秒下一次单体必暴击"), "单点爆发"),
+                "set30_arc": ("霜火共鸣", 30, ("范围半径+12%", "AOE命中3目标回能", "AOE追加二次爆裂"), "范围AOE"),
+                "set30_pal": ("圣辉庇护", 30, ("生命+10%", "低血触发护盾", "治疗溢出转护盾"), "坦度回复"),
+                "set40_iron": ("不屈征伐", 40, ("近战伤害+12%", "震荡波强化", "终结技后6秒攻防+18%"), "均衡"),
+                "set40_hunt": ("寂灭猎神", 40, ("暴击率+12%", "穿刺可弹射1目标", "第3次单体必暴击+暴伤"), "单点爆发"),
+                "set40_arc": ("万象崩界", 40, ("范围+18%", "AOE触发连锁闪电", "AOE二次爆裂45%"), "范围AOE"),
+                "set40_pal": ("誓约圣裁", 40, ("生命+15%", "护盾存在时持续回复", "治疗溢出转护盾并分担伤害"), "坦度回复"),
+                "set50_iron": ("深渊统御", 50, ("近战伤害+16%", "连击震荡附破甲", "终结技后8秒攻防+25%"), "均衡"),
+                "set50_hunt": ("终夜裁决", 50, ("暴击率+15%", "命中Boss叠猎印", "消耗猎印高倍率斩杀"), "单点爆发"),
+                "set50_arc": ("虚空洪流", 50, ("范围+22%", "连锁额外弹射2次", "命中5目标触发全屏小爆"), "范围AOE"),
+                "set50_pal": ("光耀圣域", 50, ("生命+20%", "护盾破裂回复已损生命", "开启圣域全队减伤"), "坦度回复"),
+            }
+            epic_slots = ["weapon", "helmet", "chest", "gloves", "pants", "boots"]
+            for set_key, (set_name, set_level, bonuses, trait) in epic_sets.items():
+                for tier, bonus_desc in ((2, bonuses[0]), (4, bonuses[1]), (6, bonuses[2])):
+                    conn.execute(
+                        "INSERT INTO set_bonuses (set_key, tier, bonus_desc) VALUES (?, ?, ?)",
+                        (set_key, tier, bonus_desc),
+                    )
+                for slot in epic_slots:
+                    power = int(round((22 if slot == "weapon" else 14) * (1 + (set_level - 1) * 0.055) * 1.75))
+                    item_id = f"{set_key.upper()}-{slot.upper()}"
+                    name = f"{set_name}{slot_cn[slot]}·Lv{set_level}"
+                    conn.execute(
+                        """
+                        INSERT INTO game_items (item_id, name, slot, quality, level_required, power, set_key, set_level, bonus_trait)
+                        VALUES (?, ?, ?, '史诗', ?, ?, ?, ?, ?)
+                        """,
+                        (item_id, name, slot, set_level, power, set_key, set_level, trait),
+                    )
+
+        has_dungeon = conn.execute("SELECT 1 FROM dungeons_game LIMIT 1").fetchone()
+        if not has_dungeon:
+            dungeons = [
+                ("DUN30", "黑岩熔炉", 30, 30, 20, 4, "30级史诗副本，建议20级精良以上"),
+                ("DUN40", "霜骨王庭", 40, 40, 30, 6, "40级史诗副本，要求30级史诗全套"),
+                ("DUN50", "深渊裂隙", 50, 50, 40, 6, "50级终局副本，建议40级史诗全套"),
+            ]
+            for row in dungeons:
+                conn.execute(
+                    """
+                    INSERT INTO dungeons_game
+                    (dungeon_id, name, recommended_level, difficulty_tier, min_set_level, min_set_pieces, description)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    row,
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_player_game_state(user_id: int) -> None:
+    conn = get_db()
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM player_progress WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO player_progress (user_id, level, exp, created_at) VALUES (?, 1, 0, ?)",
+                (user_id, now_iso()),
+            )
+            conn.execute(
+                """
+                INSERT INTO player_wallet
+                (user_id, gold, normal_ticket, advanced_ticket, enhance_stone, reroll_stone, epic_shard)
+                VALUES (?, 200, 1, 0, 10, 6, 0)
+                """,
+                (user_id,),
+            )
+            starter_ids = [
+                "BASE-WEAPON-1-普通",
+                "BASE-HELMET-1-普通",
+                "BASE-CHEST-1-普通",
+                "BASE-GLOVES-1-普通",
+                "BASE-PANTS-1-普通",
+                "BASE-BOOTS-1-普通",
+            ]
+            for item_id in starter_ids:
+                conn.execute(
+                    """
+                    INSERT INTO player_inventory (user_id, item_id, equipped, quantity, created_at)
+                    VALUES (?, ?, 1, 1, ?)
+                    """,
+                    (user_id, item_id, now_iso()),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def level_need_exp(level: int) -> int:
+    return 100 + (level - 1) * 35
+
+
+def add_player_exp(user_id: int, gained_exp: int) -> dict[str, int]:
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT level, exp FROM player_progress WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            init_player_game_state(user_id)
+            row = conn.execute(
+                "SELECT level, exp FROM player_progress WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+
+        level = int(row["level"])
+        exp = int(row["exp"]) + max(0, gained_exp)
+        while level < 50:
+            need = level_need_exp(level)
+            if exp < need:
+                break
+            exp -= need
+            level += 1
+        if level >= 50:
+            level = 50
+            exp = 0
+        conn.execute(
+            "UPDATE player_progress SET level = ?, exp = ? WHERE user_id = ?",
+            (level, exp, user_id),
+        )
+        conn.commit()
+        return {"level": level, "exp": exp}
+    finally:
+        conn.close()
+
+
+def add_wallet_values(
+    user_id: int,
+    gold: int = 0,
+    normal_ticket: int = 0,
+    advanced_ticket: int = 0,
+    enhance_stone: int = 0,
+    reroll_stone: int = 0,
+    epic_shard: int = 0,
+) -> None:
+    conn = get_db()
+    try:
+        conn.execute(
+            """
+            UPDATE player_wallet
+            SET gold = gold + ?,
+                normal_ticket = normal_ticket + ?,
+                advanced_ticket = advanced_ticket + ?,
+                enhance_stone = enhance_stone + ?,
+                reroll_stone = reroll_stone + ?,
+                epic_shard = epic_shard + ?
+            WHERE user_id = ?
+            """,
+            (gold, normal_ticket, advanced_ticket, enhance_stone, reroll_stone, epic_shard, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def grant_item(user_id: int, item_id: str, equipped: int = 0) -> None:
+    conn = get_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO player_inventory (user_id, item_id, equipped, quantity, created_at)
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            (user_id, item_id, equipped, now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def choose_drop_item(target_level: int, source_type: str) -> dict[str, Any] | None:
+    quality_weights: dict[str, list[tuple[str, int]]] = {
+        "monster_normal": [("普通", 45), ("优秀", 35), ("精良", 18), ("史诗", 2)],
+        "monster_elite": [("普通", 20), ("优秀", 35), ("精良", 35), ("史诗", 10)],
+        "boss_world": [("普通", 8), ("优秀", 22), ("精良", 50), ("史诗", 20)],
+        "boss_dungeon": [("普通", 3), ("优秀", 10), ("精良", 52), ("史诗", 35)],
+    }
+    weights = quality_weights.get(source_type, quality_weights["monster_normal"])
+    qualities = [q for q, _ in weights]
+    probs = [w for _, w in weights]
+    chosen_quality = random.choices(qualities, weights=probs, k=1)[0]
+
+    conn = get_db()
+    try:
+        if chosen_quality == "史诗":
+            rows = conn.execute(
+                """
+                SELECT item_id, name, quality, level_required, power, set_key, bonus_trait
+                FROM game_items
+                WHERE quality = '史诗'
+                  AND level_required <= ?
+                  AND level_required >= ?
+                """,
+                (target_level, max(30, target_level - 10)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT item_id, name, quality, level_required, power, set_key, bonus_trait
+                FROM game_items
+                WHERE quality = ?
+                  AND level_required <= ?
+                """,
+                (chosen_quality, target_level),
+            ).fetchall()
+        if not rows:
+            return None
+        row = random.choice(rows)
+        return dict(row)
+    finally:
+        conn.close()
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "online_users": len(manager.online_users())}
@@ -309,6 +663,7 @@ def register(payload: RegisterRequest) -> dict[str, Any]:
     finally:
         conn.close()
 
+    init_player_game_state(user_id)
     token = create_token(user_id, username)
     return {"token": token, "user": {"user_id": user_id, "username": username}}
 
@@ -329,6 +684,7 @@ def login(payload: LoginRequest) -> dict[str, Any]:
     if not row or not verify_password(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
+    init_player_game_state(int(row["id"]))
     token = create_token(row["id"], row["username"])
     return {
         "token": token,
@@ -577,6 +933,447 @@ def my_groups(authorization: str | None = Header(default=None)) -> dict[str, Any
     return {"groups": groups}
 
 
+def get_player_profile(user_id: int) -> dict[str, Any]:
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT level, exp FROM player_progress WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            init_player_game_state(user_id)
+            row = conn.execute(
+                "SELECT level, exp FROM player_progress WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+
+        equipped_rows = conn.execute(
+            """
+            SELECT pi.id AS inventory_id, gi.item_id, gi.name, gi.slot, gi.quality, gi.level_required, gi.power, gi.set_key, gi.set_level, gi.bonus_trait
+            FROM player_inventory pi
+            JOIN game_items gi ON gi.item_id = pi.item_id
+            WHERE pi.user_id = ? AND pi.equipped = 1
+            """,
+            (user_id,),
+        ).fetchall()
+        equipped = [dict(r) for r in equipped_rows]
+        total_power = sum(int(r["power"]) for r in equipped_rows)
+
+        set_counts: dict[str, int] = {}
+        for r in equipped_rows:
+            if r["set_key"]:
+                set_counts[r["set_key"]] = set_counts.get(r["set_key"], 0) + 1
+
+        active_bonuses: list[dict[str, Any]] = []
+        for set_key, count in set_counts.items():
+            tiers = [2, 4, 6]
+            for tier in tiers:
+                if count >= tier:
+                    bonus = conn.execute(
+                        "SELECT bonus_desc FROM set_bonuses WHERE set_key = ? AND tier = ?",
+                        (set_key, tier),
+                    ).fetchone()
+                    if bonus:
+                        active_bonuses.append(
+                            {
+                                "set_key": set_key,
+                                "tier": tier,
+                                "bonus_desc": bonus["bonus_desc"],
+                            }
+                        )
+
+        wallet_row = conn.execute(
+            """
+            SELECT gold, normal_ticket, advanced_ticket, enhance_stone, reroll_stone, epic_shard
+            FROM player_wallet
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        wallet = dict(wallet_row) if wallet_row else {
+            "gold": 0,
+            "normal_ticket": 0,
+            "advanced_ticket": 0,
+            "enhance_stone": 0,
+            "reroll_stone": 0,
+            "epic_shard": 0,
+        }
+
+        return {
+            "level": int(row["level"]),
+            "exp": int(row["exp"]),
+            "total_power": total_power,
+            "equipped": equipped,
+            "set_counts": set_counts,
+            "active_bonuses": active_bonuses,
+            "wallet": wallet,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/game/bootstrap")
+def game_bootstrap(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    get_user_id_from_header(authorization)
+    maps = [
+        {"map_id": "M01", "name": "迷雾森林", "level_range": "1-12"},
+        {"map_id": "M02", "name": "断碑荒原", "level_range": "13-22"},
+        {"map_id": "M03", "name": "黑岩峡谷", "level_range": "23-32"},
+        {"map_id": "M04", "name": "霜骨墓地", "level_range": "33-42"},
+        {"map_id": "M05", "name": "深渊边境", "level_range": "43-50"},
+    ]
+    monsters = [
+        {"type": "普通怪", "hp_scale": 1.0, "atk_scale": 1.0},
+        {"type": "精英怪", "hp_scale": 2.4, "atk_scale": 1.5},
+        {"type": "地图Boss", "hp_scale": 5.0, "atk_scale": 2.2},
+        {"type": "副本Boss", "hp_scale": 10.0, "atk_scale": 2.2},
+    ]
+    conn = get_db()
+    try:
+        dungeons = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT dungeon_id, name, recommended_level, difficulty_tier, min_set_level, min_set_pieces, description FROM dungeons_game ORDER BY recommended_level"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    return {
+        "quality_rules": {
+            "tiers": ["普通", "优秀", "精良", "史诗", "传奇", "神话"],
+            "max_quality_pre_50": "史诗",
+        },
+        "maps": maps,
+        "monsters": monsters,
+        "dungeons": dungeons,
+    }
+
+
+@app.get("/game/profile")
+def game_profile(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    return {"profile": get_player_profile(user_id)}
+
+
+@app.get("/game/inventory")
+def game_inventory(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT pi.id AS inventory_id, pi.equipped, pi.quantity, gi.item_id, gi.name, gi.slot, gi.quality, gi.level_required, gi.power, gi.set_key, gi.set_level, gi.bonus_trait
+            FROM player_inventory pi
+            JOIN game_items gi ON gi.item_id = pi.item_id
+            WHERE pi.user_id = ?
+            ORDER BY gi.level_required, gi.quality
+            """,
+            (user_id,),
+        ).fetchall()
+        inventory = [dict(r) for r in rows]
+    finally:
+        conn.close()
+    return {"inventory": inventory}
+
+
+@app.post("/game/equip")
+def game_equip(
+    body: EquipRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    profile = get_player_profile(user_id)
+    conn = get_db()
+    try:
+        item = conn.execute(
+            """
+            SELECT pi.id AS inventory_id, gi.slot, gi.level_required
+            FROM player_inventory pi
+            JOIN game_items gi ON gi.item_id = pi.item_id
+            WHERE pi.id = ? AND pi.user_id = ?
+            """,
+            (body.inventory_id, user_id),
+        ).fetchone()
+        if not item:
+            raise HTTPException(status_code=404, detail="背包物品不存在")
+        if profile["level"] < int(item["level_required"]):
+            raise HTTPException(status_code=400, detail="等级不足，无法装备")
+
+        conn.execute(
+            """
+            UPDATE player_inventory
+            SET equipped = 0
+            WHERE user_id = ?
+              AND item_id IN (SELECT item_id FROM game_items WHERE slot = ?)
+            """,
+            (user_id, item["slot"]),
+        )
+        conn.execute(
+            "UPDATE player_inventory SET equipped = 1 WHERE id = ? AND user_id = ?",
+            (body.inventory_id, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"ok": True, "profile": get_player_profile(user_id)}
+
+
+@app.post("/game/dungeon/challenge")
+def game_dungeon_challenge(
+    body: DungeonChallengeRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    profile = get_player_profile(user_id)
+    conn = get_db()
+    try:
+        dungeon = conn.execute(
+            """
+            SELECT dungeon_id, name, recommended_level, difficulty_tier, min_set_level, min_set_pieces, description
+            FROM dungeons_game
+            WHERE dungeon_id = ?
+            """,
+            (body.dungeon_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not dungeon:
+        raise HTTPException(status_code=404, detail="副本不存在")
+
+    if profile["level"] < int(dungeon["recommended_level"]):
+        return {
+            "ok": False,
+            "reason": f"等级不足：需要 Lv{dungeon['recommended_level']}",
+            "dungeon": dict(dungeon),
+            "profile": profile,
+        }
+
+    min_set_level = int(dungeon["min_set_level"])
+    min_set_pieces = int(dungeon["min_set_pieces"])
+    count_eligible = 0
+    for eq in profile["equipped"]:
+        if eq.get("quality") == "史诗" and (eq.get("set_level") or 0) >= min_set_level:
+            count_eligible += 1
+
+    if count_eligible < min_set_pieces:
+        return {
+            "ok": False,
+            "reason": f"装备门槛不足：需要至少 {min_set_pieces} 件 Lv{min_set_level}+ 史诗装备",
+            "dungeon": dict(dungeon),
+            "profile": profile,
+            "eligible_epic_pieces": count_eligible,
+        }
+
+    return {
+        "ok": True,
+        "result": "challenge_passed",
+        "dungeon": dict(dungeon),
+        "profile": profile,
+        "note": "满足挑战门槛，可进入副本战斗流程",
+    }
+
+
+@app.post("/game/fight/monster")
+def game_fight_monster(
+    body: MonsterFightRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    profile = get_player_profile(user_id)
+
+    map_level_cap = {
+        "M01": 12,
+        "M02": 22,
+        "M03": 32,
+        "M04": 42,
+        "M05": 50,
+    }
+    if body.map_id not in map_level_cap:
+        raise HTTPException(status_code=404, detail="地图不存在")
+
+    monster_cfg = {
+        "普通怪": {"exp": 32, "gold": 24, "power_scale": 1.0, "drop_source": "monster_normal", "ticket": (0.08, 0.0)},
+        "精英怪": {"exp": 88, "gold": 70, "power_scale": 2.2, "drop_source": "monster_elite", "ticket": (0.35, 0.05)},
+        "地图Boss": {"exp": 210, "gold": 180, "power_scale": 4.8, "drop_source": "boss_world", "ticket": (0.75, 0.20)},
+    }
+    cfg = monster_cfg.get(body.monster_type)
+    if not cfg:
+        raise HTTPException(status_code=400, detail="怪物类型错误")
+
+    target_level = min(map_level_cap[body.map_id], 50)
+    player_score = profile["total_power"] + len(profile["active_bonuses"]) * 25 + profile["level"] * 6
+    required_score = int((target_level * 7 + 60) * cfg["power_scale"])
+    if player_score <= 0:
+        win_rate = 0.05
+    else:
+        ratio = player_score / max(1, required_score)
+        win_rate = max(0.10, min(0.95, 0.2 + ratio * 0.55))
+    won = random.random() < win_rate
+
+    if won:
+        exp_gain = int(cfg["exp"] * (0.85 + random.random() * 0.3))
+        gold_gain = int(cfg["gold"] * (0.85 + random.random() * 0.3))
+        add_player_exp(user_id, exp_gain)
+        add_wallet_values(user_id, gold=gold_gain)
+
+        normal_ticket_gain = 1 if random.random() < cfg["ticket"][0] else 0
+        advanced_ticket_gain = 1 if random.random() < cfg["ticket"][1] else 0
+        add_wallet_values(user_id, normal_ticket=normal_ticket_gain, advanced_ticket=advanced_ticket_gain)
+
+        dropped_item = choose_drop_item(target_level, cfg["drop_source"])
+        if dropped_item:
+            grant_item(user_id, dropped_item["item_id"], equipped=0)
+        add_wallet_values(
+            user_id,
+            enhance_stone=random.randint(1, 3) if body.monster_type != "普通怪" else random.randint(0, 1),
+            reroll_stone=random.randint(0, 2) if body.monster_type == "地图Boss" else random.randint(0, 1),
+            epic_shard=1 if dropped_item and dropped_item["quality"] == "史诗" else 0,
+        )
+    else:
+        exp_gain = int(cfg["exp"] * 0.25)
+        gold_gain = int(cfg["gold"] * 0.2)
+        add_player_exp(user_id, exp_gain)
+        add_wallet_values(user_id, gold=gold_gain)
+        dropped_item = None
+        normal_ticket_gain = 0
+        advanced_ticket_gain = 0
+
+    return {
+        "ok": True,
+        "won": won,
+        "map_id": body.map_id,
+        "monster_type": body.monster_type,
+        "win_rate_estimate": round(win_rate, 3),
+        "rewards": {
+            "exp": exp_gain,
+            "gold": gold_gain,
+            "normal_ticket": normal_ticket_gain,
+            "advanced_ticket": advanced_ticket_gain,
+            "item": dropped_item,
+        },
+        "profile": get_player_profile(user_id),
+    }
+
+
+@app.post("/game/dungeon/settle")
+def game_dungeon_settle(
+    body: DungeonSettleRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    gate = game_dungeon_challenge(DungeonChallengeRequest(dungeon_id=body.dungeon_id), authorization)
+    if not gate["ok"]:
+        return {"ok": False, "reason": "未满足副本挑战门槛", "gate": gate}
+
+    dungeon = gate["dungeon"]
+    target_level = int(dungeon["recommended_level"])
+    is_boss_source = "boss_dungeon"
+    if not body.cleared:
+        add_player_exp(user_id, int(target_level * 2.2))
+        add_wallet_values(user_id, gold=int(target_level * 10))
+        return {
+            "ok": True,
+            "cleared": False,
+            "rewards": {"exp": int(target_level * 2.2), "gold": int(target_level * 10)},
+            "profile": get_player_profile(user_id),
+        }
+
+    exp_gain = int(target_level * 7.5 + 140)
+    gold_gain = int(target_level * 22 + 200)
+    add_player_exp(user_id, exp_gain)
+    add_wallet_values(
+        user_id,
+        gold=gold_gain,
+        normal_ticket=random.randint(1, 2),
+        advanced_ticket=1 if random.random() < (0.20 if target_level < 50 else 0.45) else 0,
+        enhance_stone=random.randint(3, 6),
+        reroll_stone=random.randint(1, 3),
+    )
+    item_count = 2 if target_level >= 40 else 1
+    drops: list[dict[str, Any]] = []
+    for _ in range(item_count):
+        item = choose_drop_item(target_level, is_boss_source)
+        if item:
+            grant_item(user_id, item["item_id"], equipped=0)
+            drops.append(item)
+            if item["quality"] == "史诗":
+                add_wallet_values(user_id, epic_shard=2)
+
+    return {
+        "ok": True,
+        "cleared": True,
+        "dungeon_id": body.dungeon_id,
+        "rewards": {"exp": exp_gain, "gold": gold_gain, "items": drops},
+        "profile": get_player_profile(user_id),
+    }
+
+
+@app.post("/game/gacha/draw")
+def game_gacha_draw(
+    body: GachaDrawRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    pool = body.pool.lower()
+    if pool not in {"normal", "advanced"}:
+        raise HTTPException(status_code=400, detail="抽奖池仅支持 normal / advanced")
+
+    profile = get_player_profile(user_id)
+    wallet = profile["wallet"]
+    ticket_field = "normal_ticket" if pool == "normal" else "advanced_ticket"
+    cost = body.count
+    if int(wallet[ticket_field]) < cost:
+        raise HTTPException(status_code=400, detail="抽奖券不足")
+
+    if pool == "normal":
+        add_wallet_values(user_id, normal_ticket=-cost)
+    else:
+        add_wallet_values(user_id, advanced_ticket=-cost)
+
+    rewards: list[dict[str, Any]] = []
+    for _ in range(body.count):
+        roll = random.random()
+        if pool == "normal":
+            if roll < 0.50:
+                gold = random.randint(120, 260)
+                add_wallet_values(user_id, gold=gold)
+                rewards.append({"type": "gold", "amount": gold})
+            elif roll < 0.78:
+                stone = random.randint(1, 3)
+                add_wallet_values(user_id, enhance_stone=stone)
+                rewards.append({"type": "enhance_stone", "amount": stone})
+            elif roll < 0.92:
+                stone = random.randint(1, 2)
+                add_wallet_values(user_id, reroll_stone=stone)
+                rewards.append({"type": "reroll_stone", "amount": stone})
+            else:
+                item = choose_drop_item(min(50, profile["level"] + 5), "monster_elite")
+                if item:
+                    grant_item(user_id, item["item_id"], equipped=0)
+                    rewards.append({"type": "item", "item": item})
+        else:
+            if roll < 0.30:
+                gold = random.randint(300, 520)
+                add_wallet_values(user_id, gold=gold)
+                rewards.append({"type": "gold", "amount": gold})
+            elif roll < 0.52:
+                shard = random.randint(2, 5)
+                add_wallet_values(user_id, epic_shard=shard)
+                rewards.append({"type": "epic_shard", "amount": shard})
+            elif roll < 0.72:
+                stone = random.randint(2, 4)
+                add_wallet_values(user_id, reroll_stone=stone)
+                rewards.append({"type": "reroll_stone", "amount": stone})
+            else:
+                item = choose_drop_item(max(30, min(50, profile["level"] + 8)), "boss_dungeon")
+                if item:
+                    grant_item(user_id, item["item_id"], equipped=0)
+                    rewards.append({"type": "item", "item": item})
+
+    return {"ok": True, "pool": pool, "count": body.count, "rewards": rewards, "profile": get_player_profile(user_id)}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     token = websocket.query_params.get("token", "").strip()
@@ -636,7 +1433,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             ts = now_iso()
-            conn = get_db()
 
             if action == "lobby" or action == "world":
                 await manager.broadcast_lobby(
