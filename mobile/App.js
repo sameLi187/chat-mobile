@@ -1627,7 +1627,7 @@ export default function App() {
             <View style={styles.rowItem}>
               <View style={{ flex: 1 }}>
                 <Text style={{ fontWeight: "700" }}>一键出售（不含已穿戴）</Text>
-                <Text style={styles.mutedSmall}>出售等级 <= {batchSellMaxLevel || 1} 且匹配品质</Text>
+                <Text style={styles.mutedSmall}>出售等级 {"<="} {batchSellMaxLevel || 1} 且匹配品质</Text>
               </View>
               <TextInput
                 style={[styles.input, { width: 64, marginBottom: 0, textAlign: "center" }]}
