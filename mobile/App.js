@@ -606,22 +606,34 @@ export default function App() {
     if (!fightSnapshot?.fight_id || fightCommitting) return;
     setFightCommitting(true);
     try {
-      const res = await callGameApi("/game/fight/commit", "POST", { fight_id: fightSnapshot.fight_id });
+      const isDungeonFight = fightSnapshot?.fight_mode === "dungeon";
+      const commitPath = isDungeonFight ? "/game/dungeon/commit" : "/game/fight/commit";
+      const res = await callGameApi(commitPath, "POST", {
+        fight_id: fightSnapshot.fight_id,
+        player_hp: Math.max(0, Math.round(fightPlayerHp || 0)),
+        monster_hp: Math.max(0, Math.round(fightMonsterHp || 0)),
+      });
       if (res.ok) {
         const lootItems = res.data.rewards?.item ? [res.data.rewards.item] : [];
-        const monsterName = getMonsterDisplayName(selectedMap, selectedMonsterType);
+        const dungeonItems = res.data.rewards?.items || [];
+        const itemsFinal = isDungeonFight ? dungeonItems : lootItems;
+        const monsterName = isDungeonFight
+          ? getDungeonBossName(selectedDungeon)
+          : getMonsterDisplayName(selectedMap, selectedMonsterType);
+        const wonFlag = isDungeonFight ? Boolean(res.data.cleared) : Boolean(res.data.won);
         if (res.data.rewards?.skill_id) appendFightLog(`获得技能掉落: ${res.data.rewards.skill_id}`);
         openResultModal(
           `${monsterName} 结果`,
-          lootItems,
+          itemsFinal,
           [
-            `${res.data.won ? "胜利" : "失败"} | 经验+${res.data.rewards.exp} | 金币+${res.data.rewards.gold}`,
-            `胜率 ${Math.round((res.data.win_rate_estimate || 0) * 100)}%`,
+            `${wonFlag ? "胜利" : "失败"} | 经验+${res.data.rewards.exp} | 金币+${res.data.rewards.gold}`,
+            `胜率 ${Math.round(((res.data.win_rate_estimate ?? res.data.clear_rate_estimate) || 0) * 100)}%`,
             res.data.rewards?.skill_id ? `技能掉落: ${res.data.rewards.skill_id}` : "技能掉落: 无",
           ],
         );
         await refreshGameState();
         await loadSkillShop();
+        if (isDungeonFight) setDungeonUiVisible(false);
       } else {
         pushGameLog(`战斗结算失败: ${res.data.detail || "请求错误"}`);
       }
@@ -658,6 +670,105 @@ export default function App() {
     ]).start();
   };
 
+  const openRealtimeFightSession = (data, encounterText) => {
+    const now = Date.now();
+    setFightSnapshot(data);
+    setFightPlayerHp(Number(data.player?.max_hp || 1));
+    setFightMonsterHp(Number(data.monster?.max_hp || 1));
+    setFightLog([]);
+    setFightEnded(false);
+    setBasicReadyAt(now);
+    setSkillReadyAts(Array(6).fill(now));
+    setMonsterSkillReadyAts((data.monster?.skills || []).map(() => now));
+    setPlayerActionLockedUntil(now);
+    setMonsterComboBasicCount(0);
+    setFloatingTexts([]);
+    setFightUiVisible(true);
+    appendFightLog(encounterText);
+    if (data.monster?.mechanic) {
+      appendFightLog(`Boss机制：${data.monster.mechanic.name} - ${data.monster.mechanic.desc}`);
+    }
+
+    if (monsterActionRef.current) clearInterval(monsterActionRef.current);
+    monsterActionRef.current = setInterval(() => {
+      let currentMonsterHp = fightMonsterHp;
+      setFightMonsterHp((mh) => {
+        currentMonsterHp = mh;
+        if (fightEnded || mh <= 0) return mh;
+        return mh;
+      });
+      setFightPlayerHp((hp) => {
+        if (fightEnded || hp <= 0) return hp;
+        const nowTs = Date.now();
+        let fired = -1;
+        let skill = null;
+        setMonsterSkillReadyAts((prev) => {
+          const next = [...prev];
+          const mhRatio = currentMonsterHp / Math.max(1, Number(data.monster?.max_hp || 1));
+          const ai = data.monster?.ai || {};
+          const triggerPriority = ai.trigger_priority || {};
+          const comboBonus = Number(ai.combo_followup_bonus || 0);
+          const canUse = (s, i) => {
+            if (nowTs < next[i]) return false;
+            const tr = s?.trigger || "always";
+            if (tr === "always") return true;
+            if (tr === "after_basic_2") return monsterComboBasicCount >= 2;
+            if (tr === "hp_below_70") return mhRatio <= 0.7;
+            if (tr === "hp_below_35") return mhRatio <= 0.35;
+            return true;
+          };
+          let bestScore = -1e9;
+          for (let i = 0; i < next.length; i += 1) {
+            const cur = data.monster.skills[i];
+            if (canUse(cur, i)) {
+              const tr = cur?.trigger || "always";
+              let score = Number(triggerPriority[tr] || 0);
+              if (cur?.id !== "m_basic" && monsterComboBasicCount >= 2) score += comboBonus;
+              score += Math.random() * 0.1;
+              if (score > bestScore) {
+                bestScore = score;
+                fired = i;
+              }
+            }
+          }
+          if (fired >= 0) {
+            skill = data.monster.skills[fired];
+            next[fired] = nowTs + (skill?.cd_ms || 1200);
+          }
+          return next;
+        });
+        if (fired < 0 || !skill) return hp;
+        if (skill.id === "m_basic") setMonsterComboBasicCount((c) => c + 1);
+        else setMonsterComboBasicCount(0);
+        const mhRatio = currentMonsterHp / Math.max(1, Number(data.monster?.max_hp || 1));
+        const enrageBoost =
+          data.monster?.mechanic?.id === "enrage_phase" && mhRatio <= 0.35 ? 1.22 : 1;
+        const summonBoost = data.monster?.mechanic?.id === "summon_phase" && Math.random() < 0.18 ? 1.12 : 1;
+        const base = (Number(data.monster.attack || 1) * Number(skill.mult || 1) * enrageBoost * summonBoost) - Number(data.player.defense || 0) * 0.35;
+        const dmg = Math.max(1, Math.round(base * Number(data.balance?.monster_out || 1)));
+        if (skill.id !== "m_basic") appendFightLog(`${data.monster.name} 使用${skill.name}，造成 ${dmg} 伤害`);
+        animateHit(playerHitFlash);
+        addFloatingText("player", `-${dmg}`);
+        setPlayerActionLockedUntil(Date.now() + 220);
+        const nh = Math.max(0, hp - dmg);
+        if (nh <= 0) setFightEnded(true);
+        return nh;
+      });
+    }, 220);
+
+    if (playerRegenRef.current) clearInterval(playerRegenRef.current);
+    playerRegenRef.current = setInterval(() => {
+      if (fightEnded) return;
+      const regenRate = Number(data.balance?.regen || 0);
+      if (regenRate <= 0) return;
+      setFightPlayerHp((hp) => {
+        const maxHp = Number(data.player?.max_hp || 1);
+        if (hp >= maxHp) return hp;
+        return Math.min(maxHp, hp + Math.max(1, Math.round(maxHp * regenRate)));
+      });
+    }, 800);
+  };
+
   const startRealtimeFight = async () => {
     setGameLoading(true);
     try {
@@ -670,102 +781,38 @@ export default function App() {
         return;
       }
       const data = res.data;
-      const now = Date.now();
-      setFightSnapshot(data);
-      setFightPlayerHp(Number(data.player?.max_hp || 1));
-      setFightMonsterHp(Number(data.monster?.max_hp || 1));
-      setFightLog([]);
-      setFightEnded(false);
-      setBasicReadyAt(now);
-      setSkillReadyAts(Array(6).fill(now));
-      setMonsterSkillReadyAts((data.monster?.skills || []).map(() => now));
-      setPlayerActionLockedUntil(now);
-      setMonsterComboBasicCount(0);
-      setFloatingTexts([]);
-      setFightUiVisible(true);
-      appendFightLog(`遭遇 ${getMonsterDisplayName(selectedMap, selectedMonsterType)}，预计胜率 ${Math.round((data.win_rate_estimate || 0) * 100)}%`);
-      if (data.monster?.mechanic) {
-        appendFightLog(`Boss机制：${data.monster.mechanic.name} - ${data.monster.mechanic.desc}`);
+      openRealtimeFightSession(
+        data,
+        `遭遇 ${getMonsterDisplayName(selectedMap, selectedMonsterType)}，预计胜率 ${Math.round((data.win_rate_estimate || 0) * 100)}%`,
+      );
+    } finally {
+      setGameLoading(false);
+    }
+  };
+
+  const startDungeonRealtimeFight = async () => {
+    const eventChoices = {};
+    selectedDungeonNodes.forEach((node, idx) => {
+      if (!["treasure", "heal", "elite"].includes(node)) return;
+      const k = `${selectedDungeon}-${idx}`;
+      if (dungeonEventState[k]) eventChoices[String(idx)] = dungeonEventState[k];
+    });
+    setGameLoading(true);
+    try {
+      const res = await callGameApi("/game/dungeon/engage", "POST", {
+        dungeon_id: selectedDungeon,
+        current_room_index: dungeonRoomIndex,
+        event_choices: eventChoices,
+      });
+      if (!res.ok || !res.data?.ok) {
+        pushGameLog(`副本战斗初始化失败: ${res.data?.reason || res.data?.detail || "请求错误"}`);
+        return;
       }
-
-      if (monsterActionRef.current) clearInterval(monsterActionRef.current);
-      monsterActionRef.current = setInterval(() => {
-        let currentMonsterHp = fightMonsterHp;
-        setFightMonsterHp((mh) => {
-          currentMonsterHp = mh;
-          if (fightEnded || mh <= 0) return mh;
-          return mh;
-        });
-        setFightPlayerHp((hp) => {
-          if (fightEnded || hp <= 0) return hp;
-          const nowTs = Date.now();
-          let fired = -1;
-          let skill = null;
-          setMonsterSkillReadyAts((prev) => {
-            const next = [...prev];
-            const mhRatio = currentMonsterHp / Math.max(1, Number(data.monster?.max_hp || 1));
-              const ai = data.monster?.ai || {};
-              const triggerPriority = ai.trigger_priority || {};
-              const comboBonus = Number(ai.combo_followup_bonus || 0);
-            const canUse = (s, i) => {
-              if (nowTs < next[i]) return false;
-              const tr = s?.trigger || "always";
-              if (tr === "always") return true;
-              if (tr === "after_basic_2") return monsterComboBasicCount >= 2;
-              if (tr === "hp_below_70") return mhRatio <= 0.7;
-              if (tr === "hp_below_35") return mhRatio <= 0.35;
-              return true;
-            };
-              let bestScore = -1e9;
-              for (let i = 0; i < next.length; i += 1) {
-              const cur = data.monster.skills[i];
-              if (canUse(cur, i)) {
-                  const tr = cur?.trigger || "always";
-                  let score = Number(triggerPriority[tr] || 0);
-                  if (cur?.id !== "m_basic" && monsterComboBasicCount >= 2) score += comboBonus;
-                  score += Math.random() * 0.1;
-                  if (score > bestScore) {
-                    bestScore = score;
-                    fired = i;
-                  }
-              }
-            }
-            if (fired >= 0) {
-              skill = data.monster.skills[fired];
-              next[fired] = nowTs + (skill?.cd_ms || 1200);
-            }
-            return next;
-          });
-          if (fired < 0 || !skill) return hp;
-          if (skill.id === "m_basic") setMonsterComboBasicCount((c) => c + 1);
-          else setMonsterComboBasicCount(0);
-          const mhRatio = currentMonsterHp / Math.max(1, Number(data.monster?.max_hp || 1));
-          const enrageBoost =
-            data.monster?.mechanic?.id === "enrage_phase" && mhRatio <= 0.35 ? 1.22 : 1;
-          const summonBoost = data.monster?.mechanic?.id === "summon_phase" && Math.random() < 0.18 ? 1.12 : 1;
-          const base = (Number(data.monster.attack || 1) * Number(skill.mult || 1) * enrageBoost * summonBoost) - Number(data.player.defense || 0) * 0.35;
-          const dmg = Math.max(1, Math.round(base * Number(data.balance?.monster_out || 1)));
-          if (skill.id !== "m_basic") appendFightLog(`${data.monster.name} 使用${skill.name}，造成 ${dmg} 伤害`);
-          animateHit(playerHitFlash);
-          addFloatingText("player", `-${dmg}`);
-          setPlayerActionLockedUntil(Date.now() + 220);
-          const nh = Math.max(0, hp - dmg);
-          if (nh <= 0) setFightEnded(true);
-          return nh;
-        });
-      }, 220);
-
-      if (playerRegenRef.current) clearInterval(playerRegenRef.current);
-      playerRegenRef.current = setInterval(() => {
-        if (fightEnded) return;
-        const regenRate = Number(data.balance?.regen || 0);
-        if (regenRate <= 0) return;
-        setFightPlayerHp((hp) => {
-          const maxHp = Number(data.player?.max_hp || 1);
-          if (hp >= maxHp) return hp;
-          return Math.min(maxHp, hp + Math.max(1, Math.round(maxHp * regenRate)));
-        });
-      }, 800);
+      const data = res.data;
+      openRealtimeFightSession(
+        data,
+        `副本Boss战开始：${getDungeonBossName(selectedDungeon)}，预计胜率 ${Math.round((data.win_rate_estimate || 0) * 100)}%`,
+      );
     } finally {
       setGameLoading(false);
     }
@@ -948,14 +995,17 @@ export default function App() {
   const settleDungeon = async () => {
     setGameLoading(true);
     try {
+      const eventChoices = {};
+      selectedDungeonNodes.forEach((node, idx) => {
+        if (!["treasure", "heal", "elite"].includes(node)) return;
+        const k = `${selectedDungeon}-${idx}`;
+        if (dungeonEventState[k]) eventChoices[String(idx)] = dungeonEventState[k];
+      });
       const res = await callGameApi("/game/dungeon/settle", "POST", {
         dungeon_id: selectedDungeon,
         cleared: true,
-        clear_rate_bonus: dungeonRunMods.clearRateBonus,
-        reward_bonus: dungeonRunMods.rewardBonus,
-        boss_scale_delta: dungeonRunMods.bossScaleDelta,
-        curse_value: dungeonRunMods.curseValue,
-        greed_value: dungeonRunMods.greedValue,
+        current_room_index: dungeonRoomIndex,
+        event_choices: eventChoices,
       });
       if (res.ok) {
         if (res.data.ok) {
@@ -1169,8 +1219,11 @@ export default function App() {
     [equippedSlots],
   );
   const fightMonsterPortrait = useMemo(
-    () => MONSTER_PORTRAITS[selectedMonsterType] || DUNGEON_NODE_ICONS.boss,
-    [selectedMonsterType],
+    () =>
+      fightSnapshot?.fight_mode === "dungeon"
+        ? DUNGEON_BOSS_IMAGES[selectedDungeon] || DUNGEON_NODE_ICONS.boss
+        : MONSTER_PORTRAITS[selectedMonsterType] || DUNGEON_NODE_ICONS.boss,
+    [selectedMonsterType, fightSnapshot, selectedDungeon],
   );
   const availableSkillsForSlot = useMemo(() => {
     if (!skillPickerSlot) return [];
@@ -1607,7 +1660,7 @@ export default function App() {
             </View>
             <View style={[styles.duoBtnRow, { marginTop: 8 }]}>
               <TouchableOpacity style={[styles.button, styles.duoBtn]} onPress={settleDungeon}>
-                <Text style={styles.buttonText}>副本结算</Text>
+                <Text style={styles.buttonText}>策略结算（旧）</Text>
               </TouchableOpacity>
             </View>
 
@@ -1748,7 +1801,9 @@ export default function App() {
           <View style={[styles.modalCard, { maxHeight: "90%" }]}>
             <Text style={styles.modalTitle}>实时战斗</Text>
             <Text style={styles.infoText}>
-              {getMapName(selectedMap)} - {getMonsterDisplayName(selectedMap, selectedMonsterType)}
+              {fightSnapshot?.fight_mode === "dungeon"
+                ? `${getDungeonName(selectedDungeon)} - ${getDungeonBossName(selectedDungeon)}`
+                : `${getMapName(selectedMap)} - ${getMonsterDisplayName(selectedMap, selectedMonsterType)}`}
             </Text>
             <Text style={styles.infoText}>
               预计胜率: {Math.round((fightSnapshot?.win_rate_estimate || 0) * 100)}%
@@ -1944,6 +1999,7 @@ export default function App() {
       >
         <View style={styles.modalBackdrop}>
           <View style={[styles.modalCard, styles.dungeonUiCard]}>
+            <ScrollView style={styles.modalScroll} contentContainerStyle={{ paddingBottom: 12 }}>
             <Text style={styles.modalTitle}>{selectedDungeonMeta?.name || "副本"}</Text>
             {DUNGEON_BACKGROUNDS[selectedDungeon] ? (
               <Image source={DUNGEON_BACKGROUNDS[selectedDungeon]} style={styles.dungeonScreenBgImage} resizeMode="cover" />
@@ -2060,13 +2116,14 @@ export default function App() {
               </TouchableOpacity>
             </View>
             <View style={[styles.duoBtnRow, { marginTop: 8 }]}>
-              <TouchableOpacity style={[styles.button, styles.duoBtn]} onPress={settleDungeon}>
-                <Text style={styles.buttonText}>挑战当前副本</Text>
+              <TouchableOpacity style={[styles.button, styles.duoBtn]} onPress={startDungeonRealtimeFight}>
+                <Text style={styles.buttonText}>发起实时Boss战</Text>
               </TouchableOpacity>
               <TouchableOpacity style={[styles.button, styles.duoBtn]} onPress={() => setDungeonUiVisible(false)}>
                 <Text style={styles.buttonText}>退出副本界面</Text>
               </TouchableOpacity>
             </View>
+            </ScrollView>
           </View>
         </View>
       </Modal>

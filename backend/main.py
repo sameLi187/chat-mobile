@@ -95,6 +95,14 @@ class DungeonSettleRequest(BaseModel):
     boss_scale_delta: float = 0.0
     curse_value: float = 0.0
     greed_value: float = 0.0
+    current_room_index: int = Field(default=0, ge=0, le=32)
+    event_choices: dict[str, str] = Field(default_factory=dict)
+
+
+class DungeonEngageRequest(BaseModel):
+    dungeon_id: str = Field(min_length=1, max_length=24)
+    current_room_index: int = Field(default=0, ge=0, le=32)
+    event_choices: dict[str, str] = Field(default_factory=dict)
 
 
 class GachaDrawRequest(BaseModel):
@@ -109,6 +117,8 @@ class SellRequest(BaseModel):
 
 class FightCommitRequest(BaseModel):
     fight_id: str = Field(min_length=8, max_length=64)
+    player_hp: int | None = Field(default=None, ge=0)
+    monster_hp: int | None = Field(default=None, ge=0)
 
 
 class BuySkillRequest(BaseModel):
@@ -167,6 +177,11 @@ class DungeonEventRollRequest(BaseModel):
 
 
 SLOT_ORDER: list[str] = ["weapon", "helmet", "chest", "gloves", "pants", "boots"]
+DUNGEON_NODE_LAYOUTS: dict[str, list[str]] = {
+    "DUN30": ["normal", "elite", "treasure", "heal", "boss"],
+    "DUN40": ["normal", "normal", "elite", "treasure", "boss"],
+    "DUN50": ["normal", "elite", "heal", "elite", "boss"],
+}
 SLOT_LABELS_CN: dict[str, str] = {
     "weapon": "武器",
     "helmet": "头盔",
@@ -1145,10 +1160,13 @@ def player_basic_cd_ms(attack: int) -> int:
     return int(max(min_cd, min(max_cd, base_cd - atk * atk_factor)))
 
 
-def battle_balance_mods(won: bool) -> dict[str, float]:
-    if won:
-        return {"player_out": 1.12, "monster_out": 0.70, "regen": 0.0045}
-    return {"player_out": 0.78, "monster_out": 1.22, "regen": 0.0}
+def battle_balance_mods(score_ratio: float) -> dict[str, float]:
+    # 实时战斗中不再按“预判输赢”强行改倍率，只做轻微平衡，核心结果由操作与技能决定。
+    ratio = max(0.3, min(2.5, float(score_ratio)))
+    player_out = max(0.92, min(1.08, 1.0 + (ratio - 1.0) * 0.06))
+    monster_out = max(0.92, min(1.08, 1.0 - (ratio - 1.0) * 0.05))
+    regen = max(0.0, min(0.0035, 0.0012 + (ratio - 1.0) * 0.001))
+    return {"player_out": round(player_out, 4), "monster_out": round(monster_out, 4), "regen": round(regen, 4)}
 
 
 def build_skill_loadout(conn: sqlite3.Connection, user_id: int, equipped: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1265,68 +1283,22 @@ def compute_world_monster_fight_payload(
     wr_cfg = get_balance_value("monster", "win_rate_formula", {"min": 0.03, "max": 0.95, "base": 0.08, "ratio_mult": 0.52, "fallback": 0.05})
     if player_score <= 0:
         win_rate = float(wr_cfg.get("fallback", 0.05))
+        ratio = 0.0
     else:
         ratio = player_score / max(1, required_score)
         win_rate = max(
             float(wr_cfg.get("min", 0.03)),
             min(float(wr_cfg.get("max", 0.95)), float(wr_cfg.get("base", 0.08)) + ratio * float(wr_cfg.get("ratio_mult", 0.52))),
         )
-    won = random.random() < win_rate
-
-    exp_gain: int
-    gold_gain: int
-    normal_ticket_gain: int
-    advanced_ticket_gain: int
-    enhance_stone: int
-    reroll_stone: int
-    epic_shard_extra: int
-    dropped_item: dict[str, Any] | None = None
-
-    if won:
-        exp_gain = int(cfg["exp"] * (0.85 + random.random() * 0.3))
-        gold_gain = int(cfg["gold"] * (0.85 + random.random() * 0.3))
-        ticket = list(cfg["ticket"]) if isinstance(cfg.get("ticket"), (tuple, list)) else [0.0, 0.0]
-        normal_ticket_gain = 1 if random.random() < float(ticket[0]) else 0
-        advanced_ticket_gain = 1 if random.random() < float(ticket[1]) else 0
-        di = choose_drop_item(target_level, cfg["drop_source"])
-        dropped_item = di
-        enhance_stone = random.randint(1, 3) if monster_type != "普通怪" else random.randint(0, 1)
-        reroll_stone = random.randint(0, 2) if monster_type == "地图Boss" else random.randint(0, 1)
-        epic_shard_extra = 0
-        if di and str(di.get("quality")) == "史诗":
-            epic_shard_extra = 1
-    else:
-        exp_gain = int(cfg["exp"] * 0.25)
-        gold_gain = int(cfg["gold"] * 0.2)
-        normal_ticket_gain = 0
-        advanced_ticket_gain = 0
-        enhance_stone = 0
-        reroll_stone = 0
-        epic_shard_extra = 0
-
-    conn = get_db()
-    try:
-        skill_drop_id = roll_skill_drop(conn, user_id, monster_type, won)
-    finally:
-        conn.close()
 
     atk = int(player_stats["attack"])
     p_max = int(player_stats["hp"])
     m_max = int(max(monster_stats["hp"], 220) * 4 + int(monster_stats["attack"]) * 2)
     payload: dict[str, Any] = {
         "version": 1,
-        "won": won,
         "map_id": map_id,
         "monster_type": monster_type,
-        "exp_gain": exp_gain,
-        "gold_gain": gold_gain,
-        "normal_ticket_gain": normal_ticket_gain,
-        "advanced_ticket_gain": advanced_ticket_gain,
-        "enhance_stone": enhance_stone,
-        "reroll_stone": reroll_stone,
-        "epic_shard_extra": epic_shard_extra,
-        "drop_item": dropped_item,
-        "skill_drop_id": skill_drop_id,
+        "target_level": target_level,
         "player_score": round(player_score, 1),
         "monster_score": round(required_score, 1),
         "win_rate_estimate": round(win_rate, 3),
@@ -1339,7 +1311,7 @@ def compute_world_monster_fight_payload(
             "monster_attack": int(monster_stats["attack"]),
             "monster_defense": int(monster_stats["defense"]),
             "basic_cd_ms": player_basic_cd_ms(atk),
-            "balance": battle_balance_mods(won),
+            "balance": battle_balance_mods(ratio),
         },
     }
     return payload
@@ -1348,18 +1320,46 @@ def compute_world_monster_fight_payload(
 def apply_world_monster_fight_payload(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     if int(payload.get("version") or 0) != 1:
         raise HTTPException(status_code=400, detail="战斗数据版本无效")
-    won = bool(payload["won"])
     map_id = str(payload["map_id"])
     monster_type = str(payload["monster_type"])
-    exp_gain = int(payload["exp_gain"])
-    gold_gain = int(payload["gold_gain"])
-    normal_ticket_gain = int(payload["normal_ticket_gain"])
-    advanced_ticket_gain = int(payload["advanced_ticket_gain"])
-    enhance_stone = int(payload["enhance_stone"])
-    reroll_stone = int(payload["reroll_stone"])
-    epic_shard_extra = int(payload["epic_shard_extra"])
-    dropped_item = payload.get("drop_item")
-    skill_drop_id = payload.get("skill_drop_id")
+    map_level_cap = get_balance_value("monster", "map_level_cap", {"M01": 12, "M02": 22, "M03": 32, "M04": 42, "M05": 50})
+    monster_cfg = get_balance_value(
+        "monster",
+        "reward_by_type",
+        {
+            "普通怪": {"exp": 32, "gold": 24, "power_scale": 1.0, "drop_source": "monster_normal", "ticket": [0.08, 0.0]},
+            "精英怪": {"exp": 88, "gold": 70, "power_scale": 2.2, "drop_source": "monster_elite", "ticket": [0.35, 0.05]},
+            "地图Boss": {"exp": 210, "gold": 180, "power_scale": 4.8, "drop_source": "boss_world", "ticket": [0.75, 0.20]},
+        },
+    )
+    cfg = monster_cfg.get(monster_type)
+    if not cfg:
+        raise HTTPException(status_code=400, detail="怪物类型错误")
+    target_level = int(payload.get("target_level") or map_level_cap.get(map_id, 1))
+    if bool(payload.get("resolved_by_hp")):
+        won = bool(payload.get("won"))
+    else:
+        won = random.random() < float(payload.get("win_rate_estimate") or 0.0)
+
+    if won:
+        exp_gain = int(float(cfg["exp"]) * (0.85 + random.random() * 0.3))
+        gold_gain = int(float(cfg["gold"]) * (0.85 + random.random() * 0.3))
+        ticket = list(cfg["ticket"]) if isinstance(cfg.get("ticket"), (tuple, list)) else [0.0, 0.0]
+        normal_ticket_gain = 1 if random.random() < float(ticket[0]) else 0
+        advanced_ticket_gain = 1 if random.random() < float(ticket[1]) else 0
+        enhance_stone = random.randint(1, 3) if monster_type != "普通怪" else random.randint(0, 1)
+        reroll_stone = random.randint(0, 2) if monster_type == "地图Boss" else random.randint(0, 1)
+        dropped_item = choose_drop_item(target_level, str(cfg["drop_source"]))
+        epic_shard_extra = 1 if dropped_item and str(dropped_item.get("quality")) == "史诗" else 0
+    else:
+        exp_gain = int(float(cfg["exp"]) * 0.25)
+        gold_gain = int(float(cfg["gold"]) * 0.2)
+        normal_ticket_gain = 0
+        advanced_ticket_gain = 0
+        enhance_stone = 0
+        reroll_stone = 0
+        dropped_item = None
+        epic_shard_extra = 0
 
     add_player_exp(user_id, exp_gain)
     add_wallet_values(
@@ -1374,6 +1374,12 @@ def apply_world_monster_fight_payload(user_id: int, payload: dict[str, Any]) -> 
     granted: dict[str, Any] | None = None
     if won and dropped_item and isinstance(dropped_item, dict) and dropped_item.get("item_id"):
         granted = grant_item(user_id, str(dropped_item["item_id"]), equipped=0, item_data=dropped_item)
+    skill_drop_id: str | None = None
+    conn = get_db()
+    try:
+        skill_drop_id = roll_skill_drop(conn, user_id, monster_type, won)
+    finally:
+        conn.close()
     if skill_drop_id:
         conn = get_db()
         try:
@@ -1977,6 +1983,9 @@ def choose_drop_item(target_level: int, source_type: str) -> dict[str, Any] | No
 
     conn = get_db()
     try:
+        world_extra = ""
+        if source_type == "boss_world":
+            world_extra = " AND (set_key IS NULL OR set_key = '') "
         if chosen_quality == "史诗":
             rows = conn.execute(
                 """
@@ -1985,6 +1994,9 @@ def choose_drop_item(target_level: int, source_type: str) -> dict[str, Any] | No
                 WHERE quality = '史诗'
                   AND level_required <= ?
                   AND level_required >= ?
+                  """
+                + world_extra
+                + """
                 """,
                 (target_level, max(30, target_level - 10)),
             ).fetchall()
@@ -1995,6 +2007,9 @@ def choose_drop_item(target_level: int, source_type: str) -> dict[str, Any] | No
                 FROM game_items
                 WHERE quality = ?
                   AND level_required <= ?
+                  """
+                + world_extra
+                + """
                 """,
                 (chosen_quality, target_level),
             ).fetchall()
@@ -2742,8 +2757,8 @@ def game_fight_engage(
     disp = payload["display"]
     return {
         "ok": True,
+        "fight_mode": "world",
         "fight_id": fight_id,
-        "won": payload["won"],
         "balance": disp["balance"],
         "monster": {
             "type": body.monster_type,
@@ -2802,6 +2817,12 @@ def game_fight_commit(
         payload: dict[str, Any] = json.loads(row["payload_json"])
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=500, detail="战斗数据损坏") from exc
+    # 以实时战斗最终血量作为结算胜负依据，避免出现“已阵亡却判定胜利”。
+    if body.player_hp is not None and body.monster_hp is not None:
+        p_hp = max(0, int(body.player_hp))
+        m_hp = max(0, int(body.monster_hp))
+        payload["won"] = bool(m_hp <= 0 and p_hp > 0)
+        payload["resolved_by_hp"] = True
     conn = get_db()
     try:
         conn.execute("DELETE FROM pending_fights WHERE fight_id = ?", (body.fight_id.strip(),))
@@ -3242,11 +3263,46 @@ def game_dungeon_settle(
     target_level = int(dungeon["recommended_level"])
     is_boss_source = "boss_dungeon"
     profile = get_player_profile(user_id)
-    clear_rate_bonus = max(-0.25, min(0.25, float(body.clear_rate_bonus or 0)))
-    reward_bonus = max(-0.3, min(0.5, float(body.reward_bonus or 0)))
-    boss_scale_delta = max(-0.25, min(0.25, float(body.boss_scale_delta or 0)))
-    curse_value = max(0.0, min(1.5, float(body.curse_value or 0)))
-    greed_value = max(0.0, min(1.5, float(body.greed_value or 0)))
+    layout = DUNGEON_NODE_LAYOUTS.get(body.dungeon_id, DUNGEON_NODE_LAYOUTS["DUN30"])
+    if body.current_room_index < len(layout) - 1:
+        return {"ok": False, "reason": "副本流程未完成，请推进到Boss房后再结算"}
+
+    # 服务端根据玩家选择重算事件加成，忽略客户端直接上传的加成值，避免篡改。
+    clear_rate_bonus = 0.0
+    reward_bonus = 0.0
+    boss_scale_delta = 0.0
+    curse_value = 0.0
+    greed_value = 0.0
+    chosen_history: list[str] = []
+    offer_count = int(get_balance_value("dungeon", "event_offer_count", 3))
+    for idx, node_type in enumerate(layout):
+        if node_type not in {"treasure", "heal", "elite"}:
+            continue
+        chosen_id = str((body.event_choices or {}).get(str(idx), "")).strip()
+        if not chosen_id:
+            return {"ok": False, "reason": f"第{idx + 1}房事件未选择，无法结算"}
+        seed_num = sum(ord(c) for c in body.dungeon_id.strip()) + idx * 997 + len(chosen_history) * 313
+        options = roll_weighted_event_options(node_type=node_type, chosen_event_ids=chosen_history, offer_count=offer_count, seed_num=seed_num)
+        picked = None
+        for op in options:
+            if str(op.get("id")) == chosen_id:
+                picked = op
+                break
+        if not picked:
+            return {"ok": False, "reason": f"第{idx + 1}房事件选择无效（已重置，请重进副本）"}
+        effect = picked.get("effect") or {}
+        clear_rate_bonus += float(effect.get("clearRateBonus") or 0.0)
+        reward_bonus += float(effect.get("rewardBonus") or 0.0)
+        boss_scale_delta += float(effect.get("bossScaleDelta") or 0.0)
+        curse_value += float(effect.get("curseValue") or 0.0)
+        greed_value += float(effect.get("greedValue") or 0.0)
+        chosen_history.append(chosen_id)
+
+    clear_rate_bonus = max(-0.25, min(0.25, clear_rate_bonus))
+    reward_bonus = max(-0.3, min(0.5, reward_bonus))
+    boss_scale_delta = max(-0.25, min(0.25, boss_scale_delta))
+    curse_value = max(0.0, min(1.5, curse_value))
+    greed_value = max(0.0, min(1.5, greed_value))
     risk_scale = 1 + curse_value * 0.16 + greed_value * 0.08
     dungeon_scale = {30: 4.8, 40: 7.2, 50: 9.2}.get(target_level, 5.0) * (1 + boss_scale_delta) * risk_scale
     boss_stats = build_combat_snapshot(target_level, dungeon_scale)
@@ -3275,7 +3331,8 @@ def game_dungeon_settle(
             "profile": get_player_profile(user_id),
         }
 
-    if random.random() > clear_rate:
+    # 改为确定性判定，减少“随机输赢”并让养成/流程选择更可预期。
+    if clear_rate < 0.5:
         fail_exp = int((target_level * 2.8) * (1 + max(0.0, (profile["level"] - target_level) * 0.012)))
         add_player_exp(user_id, fail_exp)
         add_wallet_values(user_id, gold=int(target_level * 12))
@@ -3336,6 +3393,222 @@ def game_dungeon_settle(
         "mechanic": boss_mechanic,
         "risk_track": {"curse": round(curse_value, 3), "greed": round(greed_value, 3)},
         "rewards": {"exp": exp_gain, "gold": gold_gain, "items": drops, "skill_id": skill_sid},
+        "profile": get_player_profile(user_id),
+    }
+
+
+@app.post("/game/dungeon/engage")
+def game_dungeon_engage(
+    body: DungeonEngageRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    gate = game_dungeon_challenge(DungeonChallengeRequest(dungeon_id=body.dungeon_id), authorization)
+    if not gate["ok"]:
+        return {"ok": False, "reason": "未满足副本挑战门槛", "gate": gate}
+    layout = DUNGEON_NODE_LAYOUTS.get(body.dungeon_id, DUNGEON_NODE_LAYOUTS["DUN30"])
+    if body.current_room_index < len(layout) - 1:
+        return {"ok": False, "reason": "请先推进到Boss房再发起实时副本战斗"}
+
+    clear_rate_bonus = 0.0
+    reward_bonus = 0.0
+    boss_scale_delta = 0.0
+    curse_value = 0.0
+    greed_value = 0.0
+    chosen_history: list[str] = []
+    offer_count = int(get_balance_value("dungeon", "event_offer_count", 3))
+    for idx, node_type in enumerate(layout):
+        if node_type not in {"treasure", "heal", "elite"}:
+            continue
+        chosen_id = str((body.event_choices or {}).get(str(idx), "")).strip()
+        if not chosen_id:
+            return {"ok": False, "reason": f"第{idx + 1}房事件未选择，无法发起Boss战"}
+        seed_num = sum(ord(c) for c in body.dungeon_id.strip()) + idx * 997 + len(chosen_history) * 313
+        options = roll_weighted_event_options(node_type=node_type, chosen_event_ids=chosen_history, offer_count=offer_count, seed_num=seed_num)
+        picked = None
+        for op in options:
+            if str(op.get("id")) == chosen_id:
+                picked = op
+                break
+        if not picked:
+            return {"ok": False, "reason": f"第{idx + 1}房事件选择无效（请重进副本）"}
+        effect = picked.get("effect") or {}
+        clear_rate_bonus += float(effect.get("clearRateBonus") or 0.0)
+        reward_bonus += float(effect.get("rewardBonus") or 0.0)
+        boss_scale_delta += float(effect.get("bossScaleDelta") or 0.0)
+        curse_value += float(effect.get("curseValue") or 0.0)
+        greed_value += float(effect.get("greedValue") or 0.0)
+        chosen_history.append(chosen_id)
+
+    clear_rate_bonus = max(-0.25, min(0.25, clear_rate_bonus))
+    reward_bonus = max(-0.3, min(0.5, reward_bonus))
+    boss_scale_delta = max(-0.25, min(0.25, boss_scale_delta))
+    curse_value = max(0.0, min(1.5, curse_value))
+    greed_value = max(0.0, min(1.5, greed_value))
+
+    dungeon = gate["dungeon"]
+    target_level = int(dungeon["recommended_level"])
+    risk_scale = 1 + curse_value * 0.16 + greed_value * 0.08
+    dungeon_scale = {30: 4.8, 40: 7.2, 50: 9.2}.get(target_level, 5.0) * (1 + boss_scale_delta) * risk_scale
+    boss_stats = build_combat_snapshot(target_level, dungeon_scale)
+    boss_mechanic = resolve_boss_mechanic(dungeon_id=body.dungeon_id)
+    if boss_mechanic["id"] == "shield_phase":
+        boss_stats["defense"] = int(boss_stats["defense"] * 1.2)
+    elif boss_mechanic["id"] == "summon_phase":
+        boss_stats["attack"] = int(boss_stats["attack"] * 1.15)
+    elif boss_mechanic["id"] == "enrage_phase":
+        boss_stats["attack"] = int(boss_stats["attack"] * 1.22)
+        boss_stats["hp"] = int(boss_stats["hp"] * 1.1)
+
+    profile = get_player_profile(user_id)
+    player_stats = profile["total_stats"]
+    player_score = calculate_combat_score(player_stats) + len(profile["active_bonuses"]) * 24
+    boss_score = calculate_combat_score(boss_stats)
+    ratio = player_score / max(1, boss_score) if player_score > 0 else 0.0
+    clear_rate = max(0.02, min(0.95, 0.05 + ratio * 0.5 + clear_rate_bonus - curse_value * 0.04))
+
+    p_max = int(player_stats["hp"])
+    m_max = int(max(boss_stats["hp"], 260) * 4 + int(boss_stats["attack"]) * 2)
+    fight_payload: dict[str, Any] = {
+        "version": 1,
+        "mode": "dungeon",
+        "dungeon_id": body.dungeon_id,
+        "target_level": target_level,
+        "reward_bonus": reward_bonus,
+        "curse_value": curse_value,
+        "greed_value": greed_value,
+        "clear_rate_estimate": clear_rate,
+        "boss_stats": boss_stats,
+        "boss_mechanic": boss_mechanic,
+    }
+    fight_id = str(uuid.uuid4())
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM pending_fights WHERE user_id = ?", (user_id,))
+        conn.execute(
+            "INSERT INTO pending_fights (fight_id, user_id, payload_json, created_at) VALUES (?, ?, ?, ?)",
+            (fight_id, user_id, json.dumps(fight_payload, ensure_ascii=False), now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "fight_mode": "dungeon",
+        "fight_id": fight_id,
+        "dungeon_id": body.dungeon_id,
+        "balance": battle_balance_mods(ratio),
+        "monster": {
+            "type": "副本Boss",
+            "name": str(dungeon["name"]),
+            "max_hp": m_max,
+            "attack": int(boss_stats["attack"]),
+            "defense": int(boss_stats["defense"]),
+            "skills": monster_skill_templates("地图Boss"),
+            "ai": monster_ai_profile("地图Boss"),
+            "mechanic": boss_mechanic,
+        },
+        "player": {
+            "max_hp": p_max,
+            "attack": int(player_stats["attack"]),
+            "defense": int(player_stats["defense"]),
+            "basic_cd_ms": player_basic_cd_ms(int(player_stats["attack"])),
+            "skill_bar": profile.get("skill_loadout") or [],
+        },
+        "win_rate_estimate": round(clear_rate, 3),
+    }
+
+
+@app.post("/game/dungeon/commit")
+def game_dungeon_commit(
+    body: FightCommitRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id_from_header(authorization)
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT fight_id, payload_json, created_at FROM pending_fights WHERE fight_id = ? AND user_id = ?",
+            (body.fight_id.strip(), user_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="副本战斗会话不存在或已结算")
+    payload = json.loads(row["payload_json"])
+    if str(payload.get("mode")) != "dungeon":
+        raise HTTPException(status_code=400, detail="战斗会话类型错误")
+    if body.player_hp is None or body.monster_hp is None:
+        raise HTTPException(status_code=400, detail="副本结算需提交实时HP")
+    won = bool(int(body.monster_hp) <= 0 and int(body.player_hp) > 0)
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM pending_fights WHERE fight_id = ?", (body.fight_id.strip(),))
+        conn.commit()
+    finally:
+        conn.close()
+
+    target_level = int(payload.get("target_level") or 30)
+    reward_bonus = float(payload.get("reward_bonus") or 0.0)
+    greed_value = float(payload.get("greed_value") or 0.0)
+    if won:
+        profile = get_player_profile(user_id)
+        level_scale = 1 + max(0.0, (profile["level"] - target_level) * 0.015)
+        exp_gain = int((target_level * 7.5 + 140) * level_scale * (1 + reward_bonus + greed_value * 0.12))
+        gold_gain = int((target_level * 22 + 200) * (1 + reward_bonus + greed_value * 0.18))
+        add_player_exp(user_id, exp_gain)
+        add_wallet_values(
+            user_id,
+            gold=gold_gain,
+            normal_ticket=random.randint(1, 2),
+            advanced_ticket=1 if random.random() < (0.20 if target_level < 50 else 0.45) else 0,
+            enhance_stone=random.randint(3, 6),
+            reroll_stone=random.randint(1, 3),
+        )
+        item_count = 2 if target_level >= 40 else 1
+        drops: list[dict[str, Any]] = []
+        for _ in range(item_count):
+            item = choose_drop_item(target_level, "boss_dungeon")
+            if item:
+                item = grant_item(user_id, item["item_id"], equipped=0, item_data=item)
+                drops.append(item)
+                if item["quality"] == "史诗":
+                    add_wallet_values(user_id, epic_shard=2)
+        skill_sid: str | None = None
+        conn = get_db()
+        try:
+            skill_sid = roll_dungeon_skill_drop(conn, user_id)
+            if skill_sid:
+                conn.execute(
+                    "INSERT INTO player_skills (user_id, skill_id, created_at) VALUES (?, ?, ?)",
+                    (user_id, skill_sid, now_iso()),
+                )
+            add_mastery_exp_for_loadout(conn, user_id, 20)
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "cleared": True,
+            "dungeon_id": str(payload.get("dungeon_id") or ""),
+            "mechanic": payload.get("boss_mechanic"),
+            "clear_rate_estimate": float(payload.get("clear_rate_estimate") or 0.0),
+            "rewards": {"exp": exp_gain, "gold": gold_gain, "items": drops, "skill_id": skill_sid},
+            "profile": get_player_profile(user_id),
+        }
+
+    fail_exp = int(target_level * 2.8)
+    add_player_exp(user_id, fail_exp)
+    add_wallet_values(user_id, gold=int(target_level * 12))
+    return {
+        "ok": True,
+        "cleared": False,
+        "reason": "你在实时副本战斗中被击退",
+        "dungeon_id": str(payload.get("dungeon_id") or ""),
+        "mechanic": payload.get("boss_mechanic"),
+        "clear_rate_estimate": float(payload.get("clear_rate_estimate") or 0.0),
+        "rewards": {"exp": fail_exp, "gold": int(target_level * 12)},
         "profile": get_player_profile(user_id),
     }
 
