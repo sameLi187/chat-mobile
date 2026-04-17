@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import hmac
@@ -28,7 +28,19 @@ app.add_middleware(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "chat.db"
+
+
+def resolve_db_path() -> Path:
+    """SQLite 文件路径。线上请设置 DATABASE_PATH 指向持久卷，避免重部署丢库。"""
+    raw = (os.getenv("DATABASE_PATH") or os.getenv("SQLITE_DB_PATH") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+    return (BASE_DIR / "chat.db").resolve()
+
+
+DB_PATH = resolve_db_path()
 JWT_SECRET = os.getenv("JWT_SECRET", "replace-this-in-production")
 JWT_ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
@@ -93,7 +105,7 @@ def now_iso() -> str:
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -413,6 +425,7 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+print(f"[db] sqlite path: {DB_PATH}", flush=True)
 init_db()
 
 

@@ -572,6 +572,7 @@ App 当前已支持两个模式：
 - 副本内部生物命名与展示已补全
 - 副本资源目录已创建，并补全了对应中文提示词
 - 副本真实图片资源已接入前端展示
+- 后端支持 `DATABASE_PATH` / `SQLITE_DB_PATH`，便于 Railway 等环境把 SQLite 放到持久卷，避免重部署清空用户数据
 - 每次功能更新都同步维护本 README
 
 ---
@@ -605,3 +606,25 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 - `GET /health`
 - `GET /game/bootstrap`（需 Bearer token）
+
+---
+
+## 21. 线上部署与用户数据持久化（SQLite + 持久卷）
+
+默认情况下，数据库文件在 `backend/chat.db`（与代码同目录）。在 Docker / Railway 等平台**每次重新部署**时，若未挂载持久存储，该文件会随容器文件系统一起丢失，表现为「一更新游戏内容，老账号没了」。
+
+后端已支持通过环境变量把库放到持久卷上（二选一，推荐前者）：
+
+| 变量名 | 说明 |
+|---|---|
+| `DATABASE_PATH` | SQLite 文件的**绝对路径**，例如 `/data/chat.db` |
+| `SQLITE_DB_PATH` | 与上一行等价，兼容备用命名 |
+
+**Railway 推荐做法：**
+
+1. 在服务里添加 **Volume（持久卷）**，挂载路径设为例如 `/data`。
+2. 在 Variables 里设置 `DATABASE_PATH=/data/chat.db`。
+3. 重新部署后，日志里会出现一行：`[db] sqlite path: /data/chat.db`，用于确认已指向卷。
+4. 同时务必设置强随机 `JWT_SECRET`，否则每次部署若密钥变化，旧 token 会全部失效（账号仍在，但需要重新登录）。
+
+说明：首次把库迁到卷上之后，旧容器内的 `backend/chat.db` 不会自动合并进新路径；若需要迁数据，应在切换变量前自行备份旧库并上传到卷（或短暂同时保留两路径由运维手动合并）。
